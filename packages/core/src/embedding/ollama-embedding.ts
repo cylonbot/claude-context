@@ -1,5 +1,5 @@
 import { Ollama } from 'ollama';
-import { Embedding, EmbeddingVector } from './base-embedding';
+import { Embedding, EmbeddingVector, EmbedOptions } from './base-embedding';
 
 export interface OllamaEmbeddingConfig {
     model: string;
@@ -54,7 +54,7 @@ export class OllamaEmbedding extends Embedding {
         }
     }
 
-    async embed(text: string): Promise<EmbeddingVector> {
+    async embed(text: string, _options?: EmbedOptions): Promise<EmbeddingVector> {
         // Preprocess the text
         const processedText = this.preprocessText(text);
 
@@ -88,7 +88,7 @@ export class OllamaEmbedding extends Embedding {
         };
     }
 
-    async embedBatch(texts: string[]): Promise<EmbeddingVector[]> {
+    async embedBatch(texts: string[], _options?: EmbedOptions): Promise<EmbeddingVector[]> {
         // Preprocess all texts
         const processedTexts = this.preprocessTexts(texts);
 

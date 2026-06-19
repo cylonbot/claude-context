@@ -11,6 +11,10 @@ export class FileSynchronizer {
     private snapshotPath: string;
     private ignorePatterns: string[];
     private supportedExtensions: string[];
+    // State observed by the most recent checkForChanges(), held until the caller
+    // confirms a successful index via commitChanges(). See checkForChanges().
+    private pendingFileHashes: Map<string, string> | null = null;
+    private pendingMerkleDAG: MerkleDAG | null = null;
 
     constructor(rootDir: string, ignorePatterns: string[] = [], supportedExtensions: string[] = []) {
         this.rootDir = rootDir;
@@ -245,9 +249,12 @@ export class FileSynchronizer {
             console.log('[Synchronizer] Merkle DAG has changed. Comparing file states...');
             const fileChanges = this.compareStates(this.fileHashes, newFileHashes);
 
-            this.fileHashes = newFileHashes;
-            this.merkleDAG = newMerkleDAG;
-            await this.saveSnapshot();
+            // Stash the observed state but DON'T persist it yet. The caller must call
+            // commitChanges() only after it has successfully indexed these changes, so
+            // that an interrupted/failed embedding is retried on the next sync instead
+            // of being silently marked as done (which leaves the vector DB stale forever).
+            this.pendingFileHashes = newFileHashes;
+            this.pendingMerkleDAG = newMerkleDAG;
 
             console.log(`[Synchronizer] Found changes: ${fileChanges.added.length} added, ${fileChanges.removed.length} removed, ${fileChanges.modified.length} modified.`);
             return fileChanges;
@@ -255,6 +262,24 @@ export class FileSynchronizer {
 
         console.log('[Synchronizer] No changes detected based on Merkle DAG comparison.');
         return { added: [], removed: [], modified: [] };
+    }
+
+    /**
+     * Persist the file state observed by the most recent {@link checkForChanges}.
+     * MUST be called only after the caller has successfully indexed those changes.
+     * If indexing fails (or the process dies) before this is called, the on-disk
+     * snapshot stays at the previous state and the changes are re-detected next time.
+     * No-op when there is nothing pending.
+     */
+    public async commitChanges(): Promise<void> {
+        if (!this.pendingFileHashes || !this.pendingMerkleDAG) {
+            return;
+        }
+        this.fileHashes = this.pendingFileHashes;
+        this.merkleDAG = this.pendingMerkleDAG;
+        this.pendingFileHashes = null;
+        this.pendingMerkleDAG = null;
+        await this.saveSnapshot();
     }
 
     private compareStates(oldHashes: Map<string, string>, newHashes: Map<string, string>): { added: string[], removed: string[], modified: string[] } {

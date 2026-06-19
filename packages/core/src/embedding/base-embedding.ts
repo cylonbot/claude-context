@@ -5,6 +5,21 @@ export interface EmbeddingVector {
 }
 
 /**
+ * Per-call options for embedding requests.
+ *
+ * `mode` lets providers pick a different strategy/credential depending on the
+ * operation that triggered the call:
+ *   - 'search'      — interactive query embedding (low latency preferred)
+ *   - 'full'        — initial / forced full indexing
+ *   - 'incremental' — background sync of changed files (rate-limit friendly)
+ *
+ * Providers that don't care about the mode simply ignore this argument.
+ */
+export interface EmbedOptions {
+    mode?: 'search' | 'incremental' | 'full';
+}
+
+/**
  * Abstract base class for embedding implementations
  */
 export abstract class Embedding {
@@ -51,16 +66,18 @@ export abstract class Embedding {
     /**
      * Generate text embedding vector
      * @param text Text content
+     * @param options Optional per-call options (e.g. operation mode)
      * @returns Embedding vector
      */
-    abstract embed(text: string): Promise<EmbeddingVector>;
+    abstract embed(text: string, options?: EmbedOptions): Promise<EmbeddingVector>;
 
     /**
      * Generate text embedding vectors in batch
      * @param texts Text array
+     * @param options Optional per-call options (e.g. operation mode)
      * @returns Embedding vector array
      */
-    abstract embedBatch(texts: string[]): Promise<EmbeddingVector[]>;
+    abstract embedBatch(texts: string[], options?: EmbedOptions): Promise<EmbeddingVector[]>;
 
     /**
      * Get embedding vector dimension

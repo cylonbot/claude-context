@@ -1,5 +1,6 @@
-import { OpenAIEmbedding, VoyageAIEmbedding, GeminiEmbedding, OllamaEmbedding } from "@zilliz/claude-context-core";
+import { OpenAIEmbedding, VoyageAIEmbedding, GeminiEmbedding, OllamaEmbedding, DEFAULT_FREE_RPM, DEFAULT_FREE_TPM } from "@zilliz/claude-context-core";
 import { ContextMcpConfig } from "./config.js";
+import { syncLog } from "./sync-log.js";
 
 // Helper function to create embedding instance based on provider
 export function createEmbeddingInstance(config: ContextMcpConfig): OpenAIEmbedding | VoyageAIEmbedding | GeminiEmbedding | OllamaEmbedding  {
@@ -25,10 +26,14 @@ export function createEmbeddingInstance(config: ContextMcpConfig): OpenAIEmbeddi
                 console.error(`[EMBEDDING] ❌ VoyageAI API key is required but not provided`);
                 throw new Error('VOYAGEAI_API_KEY is required for VoyageAI embedding provider');
             }
-            console.log(`[EMBEDDING] 🔧 Configuring VoyageAI with model: ${config.embeddingModel}`);
+            console.log(`[EMBEDDING] 🔧 Configuring VoyageAI with model: ${config.embeddingModel}${config.voyageaiApiKeyFree?.length ? ` (${config.voyageaiApiKeyFree.length} free key(s) + paid)` : ' (single paid key)'}`);
             const voyageEmbedding = new VoyageAIEmbedding({
                 apiKey: config.voyageaiApiKey,
-                model: config.embeddingModel
+                model: config.embeddingModel,
+                ...(config.voyageaiApiKeyFree?.length && { freeApiKeys: config.voyageaiApiKeyFree }),
+                ...(config.voyageaiFreeRpm && { freeRpm: config.voyageaiFreeRpm }),
+                ...(config.voyageaiFreeTpm && { freeTpm: config.voyageaiFreeTpm }),
+                logger: syncLog
             });
             console.log(`[EMBEDDING] ✅ VoyageAI embedding instance created successfully`);
             return voyageEmbedding;
@@ -89,7 +94,12 @@ export function logEmbeddingProviderInfo(config: ContextMcpConfig, embedding: Op
             console.log(`[EMBEDDING] OpenAI configuration - API Key: ${config.openaiApiKey ? '✅ Provided' : '❌ Missing'}, Base URL: ${config.openaiBaseUrl || 'Default'}`);
             break;
         case 'VoyageAI':
-            console.log(`[EMBEDDING] VoyageAI configuration - API Key: ${config.voyageaiApiKey ? '✅ Provided' : '❌ Missing'}`);
+            console.log(`[EMBEDDING] VoyageAI configuration - Paid Key: ${config.voyageaiApiKey ? '✅ Provided' : '❌ Missing'}`);
+            if (config.voyageaiApiKeyFree?.length) {
+                console.log(`[EMBEDDING] VoyageAI configuration - Free Keys: ✅ ${config.voyageaiApiKeyFree.length} (each ${config.voyageaiFreeRpm ?? DEFAULT_FREE_RPM} RPM / ${config.voyageaiFreeTpm ?? DEFAULT_FREE_TPM} TPM, incremental fans out)`);
+            } else {
+                console.log(`[EMBEDDING] VoyageAI configuration - Free Keys: ❌ None (all operations use the paid key)`);
+            }
             break;
         case 'Gemini':
             console.log(`[EMBEDDING] Gemini configuration - API Key: ${config.geminiApiKey ? '✅ Provided' : '❌ Missing'}, Base URL: ${config.geminiBaseUrl || 'Default'}`);

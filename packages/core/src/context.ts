@@ -407,7 +407,8 @@ export class Context {
                 });
             },
             splitter,
-            signal
+            signal,
+            'full'
         );
 
         console.log(`[Context] ✅ Codebase indexing completed! Processed ${result.processedFiles} files in total, generated ${result.totalChunks} code chunks`);
@@ -463,11 +464,17 @@ export class Context {
 
         console.log(`[Context] 🔄 Found changes: ${added.length} added, ${removed.length} removed, ${modified.length} modified.`);
 
+        // Modified files are processed twice (delete old chunks, then re-index), so the
+        // number of progress steps is removed + 2*modified + added — more than totalChanges.
+        // Use the real step count as the denominator so the percentage never exceeds 100%.
+        const totalProgressSteps = removed.length + modified.length * 2 + added.length;
         let processedChanges = 0;
         const updateProgress = (phase: string) => {
             processedChanges++;
-            const percentage = Math.round((processedChanges / (removed.length + modified.length + added.length)) * 100);
-            progressCallback?.({ phase, current: processedChanges, total: totalChanges, percentage });
+            const percentage = totalProgressSteps > 0
+                ? Math.min(100, Math.round((processedChanges / totalProgressSteps) * 100))
+                : 100;
+            progressCallback?.({ phase, current: processedChanges, total: totalProgressSteps, percentage });
         };
 
         // Handle removed files
@@ -492,9 +499,18 @@ export class Context {
                 (filePath, fileIndex, totalFiles) => {
                     updateProgress(`Indexed ${filePath} (${fileIndex}/${totalFiles})`);
                 },
-                splitter
+                splitter,
+                undefined,
+                'incremental'
             );
         }
+
+        // Persist the synchronizer snapshot only now that deletions + embedding have
+        // all succeeded. If any step above threw (e.g. an embedding/rate-limit error,
+        // or the process was killed mid-sync), we never reach here, so the snapshot
+        // stays at its previous state and these changes are re-detected and retried on
+        // the next sync instead of being silently lost.
+        await currentSynchronizer.commitChanges();
 
         console.log(`[Context] ✅ Re-indexing complete. Added: ${added.length}, Removed: ${removed.length}, Modified: ${modified.length}`);
         progressCallback?.({ phase: 'Re-indexing complete!', current: totalChanges, total: totalChanges, percentage: 100 });
@@ -553,7 +569,7 @@ export class Context {
 
             // 1. Generate query vector
             console.log(`[Context] 🔍 Generating embeddings for query: "${query}"`);
-            const queryEmbedding: EmbeddingVector = await this.embedding.embed(query);
+            const queryEmbedding: EmbeddingVector = await this.embedding.embed(query, { mode: 'search' });
             console.log(`[Context] ✅ Generated embedding vector with dimension: ${queryEmbedding.vector.length}`);
             console.log(`[Context] 🔍 First 5 embedding values: [${queryEmbedding.vector.slice(0, 5).join(', ')}]`);
 
@@ -613,7 +629,7 @@ export class Context {
         } else {
             // Regular semantic search
             // 1. Generate query vector
-            const queryEmbedding: EmbeddingVector = await this.embedding.embed(query);
+            const queryEmbedding: EmbeddingVector = await this.embedding.embed(query, { mode: 'search' });
 
             // 2. Search in vector database
             const searchResults: VectorSearchResult[] = await this.vectorDatabase.search(
@@ -850,7 +866,8 @@ export class Context {
         codebasePath: string,
         onFileProcessed?: (filePath: string, fileIndex: number, totalFiles: number) => void,
         splitter: Splitter = this.codeSplitter,
-        signal?: AbortSignal
+        signal?: AbortSignal,
+        indexMode: 'full' | 'incremental' = 'full'
     ): Promise<{ processedFiles: number; totalChunks: number; status: 'completed' | 'limit_reached' }> {
         const isHybrid = this.getIsHybrid();
         const EMBEDDING_BATCH_SIZE = Math.max(1, parseInt(envManager.get('EMBEDDING_BATCH_SIZE') || '100', 10));
@@ -892,7 +909,7 @@ export class Context {
                     // Process batch when buffer reaches EMBEDDING_BATCH_SIZE
                     if (chunkBuffer.length >= EMBEDDING_BATCH_SIZE) {
                         try {
-                            await this.processChunkBuffer(chunkBuffer);
+                            await this.processChunkBuffer(chunkBuffer, indexMode);
                         } catch (error) {
                             // Embedding errors (such as API having no quota) halt the entire indexing process and propagate upwards.
                             if (error instanceof EmbeddingError) {
@@ -936,7 +953,7 @@ export class Context {
             const searchType = isHybrid === true ? 'hybrid' : 'regular';
             console.log(`📝 Processing final batch of ${chunkBuffer.length} chunks for ${searchType}`);
             try {
-                await this.processChunkBuffer(chunkBuffer);
+                await this.processChunkBuffer(chunkBuffer, indexMode);
             } catch (error) {
                 if (error instanceof EmbeddingError) {
                     throw error;
@@ -962,7 +979,10 @@ export class Context {
     /**
  * Process accumulated chunk buffer
  */
-    private async processChunkBuffer(chunkBuffer: Array<{ chunk: CodeChunk; codebasePath: string }>): Promise<void> {
+    private async processChunkBuffer(
+        chunkBuffer: Array<{ chunk: CodeChunk; codebasePath: string }>,
+        indexMode: 'full' | 'incremental' = 'full'
+    ): Promise<void> {
         if (chunkBuffer.length === 0) return;
 
         // Extract chunks and ensure they all have the same codebasePath
@@ -975,21 +995,27 @@ export class Context {
         const isHybrid = this.getIsHybrid();
         const searchType = isHybrid === true ? 'hybrid' : 'regular';
         console.log(`[Context] 🔄 Processing batch of ${chunks.length} chunks (~${estimatedTokens} tokens) for ${searchType}`);
-        await this.processChunkBatch(chunks, codebasePath);
+        await this.processChunkBatch(chunks, codebasePath, indexMode);
     }
 
     /**
      * Process a batch of chunks
      */
-    private async processChunkBatch(chunks: CodeChunk[], codebasePath: string): Promise<void> {
+    private async processChunkBatch(
+        chunks: CodeChunk[],
+        codebasePath: string,
+        indexMode: 'full' | 'incremental' = 'full'
+    ): Promise<void> {
         const isHybrid = this.getIsHybrid();
 
-        // Generate embedding vectors
+        // Generate embedding vectors. The mode selects the credential/throttling
+        // strategy in providers that support it (e.g. VoyageAI dual-key mode):
+        // 'full' → paid key, 'incremental' → free key with rate-limit waiting.
         const chunkContents = chunks.map(chunk => chunk.content);
 
         let embeddings: EmbeddingVector[];
         try {
-            embeddings = await this.embedding.embedBatch(chunkContents);
+            embeddings = await this.embedding.embedBatch(chunkContents, { mode: indexMode });
         } catch (error) {
             const errorMessage = error instanceof Error ? error.message : String(error);
             // Include batch size in the log/error message so operators can

@@ -1,4 +1,4 @@
-import { envManager } from "@zilliz/claude-context-core";
+import { envManager, DEFAULT_FREE_RPM, DEFAULT_FREE_TPM } from "@zilliz/claude-context-core";
 
 export interface ContextMcpConfig {
     name: string;
@@ -9,7 +9,10 @@ export interface ContextMcpConfig {
     // Provider-specific API keys
     openaiApiKey?: string;
     openaiBaseUrl?: string;
-    voyageaiApiKey?: string;
+    voyageaiApiKey?: string;        // paid / commercial key (VOYAGEAI_API_KEY)
+    voyageaiApiKeyFree: string[];   // free key pool (VOYAGEAI_API_KEY_FREE, comma-separated; [] if unset)
+    voyageaiFreeRpm?: number;       // free-tier requests per minute (default 3)
+    voyageaiFreeTpm?: number;       // free-tier tokens per minute (default 10000)
     geminiApiKey?: string;
     geminiBaseUrl?: string;
     // OpenRouter configuration
@@ -129,11 +132,18 @@ function getPositiveIntegerFromEnv(name: string): number | undefined {
         return parsedValue;
     }
 
-    console.warn(`[DEBUG] ⚠️  Ignoring invalid ${name}: ${rawValue}. Expected a positive integer.`);
+    console.warn(`[MCP] ⚠️  Ignoring invalid ${name}: ${rawValue}. Expected a positive integer.`);
     return undefined;
 }
 
+/** Parse a comma-separated list of API keys (e.g. VOYAGEAI_API_KEY_FREE) into a trimmed, non-empty array. */
+function parseFreeKeys(raw: string | undefined): string[] {
+    return (raw || '').split(',').map(s => s.trim()).filter(Boolean);
+}
+
 export function createMcpConfig(): ContextMcpConfig {
+    const voyageaiFreeKeys = parseFreeKeys(envManager.get('VOYAGEAI_API_KEY_FREE'));
+
     // Debug: Print all environment variables related to Context
     console.log(`[DEBUG] 🔍 Environment Variables Debug:`);
     console.log(`[DEBUG]   EMBEDDING_PROVIDER: ${envManager.get('EMBEDDING_PROVIDER') || 'NOT SET'}`);
@@ -142,6 +152,8 @@ export function createMcpConfig(): ContextMcpConfig {
     console.log(`[DEBUG]   OLLAMA_MODEL: ${envManager.get('OLLAMA_MODEL') || 'NOT SET'}`);
     console.log(`[DEBUG]   GEMINI_API_KEY: ${envManager.get('GEMINI_API_KEY') ? 'SET (length: ' + envManager.get('GEMINI_API_KEY')!.length + ')' : 'NOT SET'}`);
     console.log(`[DEBUG]   OPENAI_API_KEY: ${envManager.get('OPENAI_API_KEY') ? 'SET (length: ' + envManager.get('OPENAI_API_KEY')!.length + ')' : 'NOT SET'}`);
+    console.log(`[DEBUG]   VOYAGEAI_API_KEY (paid): ${envManager.get('VOYAGEAI_API_KEY') ? 'SET' : 'NOT SET'}`);
+    console.log(`[DEBUG]   VOYAGEAI_API_KEY_FREE: ${voyageaiFreeKeys.length} key(s)`);
     console.log(`[DEBUG]   MILVUS_ADDRESS: ${envManager.get('MILVUS_ADDRESS') || 'NOT SET'}`);
     console.log(`[DEBUG]   CODE_CHUNKS_COLLECTION_NAME_OVERRIDE: ${envManager.get('CODE_CHUNKS_COLLECTION_NAME_OVERRIDE') || 'NOT SET'}`);
     console.log(`[DEBUG]   NODE_ENV: ${envManager.get('NODE_ENV') || 'NOT SET'}`);
@@ -156,6 +168,9 @@ export function createMcpConfig(): ContextMcpConfig {
         openaiApiKey: envManager.get('OPENAI_API_KEY'),
         openaiBaseUrl: envManager.get('OPENAI_BASE_URL'),
         voyageaiApiKey: envManager.get('VOYAGEAI_API_KEY'),
+        voyageaiApiKeyFree: voyageaiFreeKeys,
+        voyageaiFreeRpm: getPositiveIntegerFromEnv('VOYAGEAI_FREE_RPM'),
+        voyageaiFreeTpm: getPositiveIntegerFromEnv('VOYAGEAI_FREE_TPM'),
         geminiApiKey: envManager.get('GEMINI_API_KEY'),
         geminiBaseUrl: envManager.get('GEMINI_BASE_URL'),
         // OpenRouter configuration
@@ -194,7 +209,13 @@ export function logConfigurationSummary(config: ContextMcpConfig): void {
             }
             break;
         case 'VoyageAI':
-            console.log(`[MCP]   VoyageAI API Key: ${config.voyageaiApiKey ? '✅ Configured' : '❌ Missing'}`);
+            console.log(`[MCP]   VoyageAI Paid Key (VOYAGEAI_API_KEY): ${config.voyageaiApiKey ? '✅ Configured' : '❌ Missing'}`);
+            const freeCount = config.voyageaiApiKeyFree?.length ?? 0;
+            if (freeCount > 0) {
+                console.log(`[MCP]   VoyageAI Free Keys (VOYAGEAI_API_KEY_FREE): ✅ ${freeCount} key(s) (search + incremental; each ${config.voyageaiFreeRpm ?? DEFAULT_FREE_RPM} RPM / ${config.voyageaiFreeTpm ?? DEFAULT_FREE_TPM} TPM)`);
+            } else {
+                console.log(`[MCP]   VoyageAI Free Keys (VOYAGEAI_API_KEY_FREE): ❌ None — all operations use the paid key`);
+            }
             break;
         case 'Gemini':
             console.log(`[MCP]   Gemini API Key: ${config.geminiApiKey ? '✅ Configured' : '❌ Missing'}`);
@@ -238,7 +259,16 @@ Environment Variables:
   Provider-specific API Keys:
   OPENAI_API_KEY          OpenAI API key (required for OpenAI provider)
   OPENAI_BASE_URL         OpenAI API base URL (optional, for custom endpoints)
-  VOYAGEAI_API_KEY        VoyageAI API key (required for VoyageAI provider)
+  VOYAGEAI_API_KEY        VoyageAI paid/commercial API key (required for VoyageAI provider).
+                          Used for full indexing and as the search fallback.
+  VOYAGEAI_API_KEY_FREE   Optional pool of free-tier VoyageAI keys, COMMA-SEPARATED
+                          (e.g. pa-aaa,pa-bbb,pa-ccc). Each key gets its own RPM/TPM
+                          window. Search uses any key that still has budget (else paid);
+                          incremental background indexing fans out across all of them
+                          (one worker per key ≈ N× throughput), never touching the paid
+                          key. If unset, all operations use VOYAGEAI_API_KEY.
+  VOYAGEAI_FREE_RPM       Per-key free requests-per-minute limit (default: 3).
+  VOYAGEAI_FREE_TPM       Per-key free tokens-per-minute limit (default: 10000).
   GEMINI_API_KEY          Google AI API key (required for Gemini provider)
   GEMINI_BASE_URL         Gemini API base URL (optional, for custom endpoints)
   OPENROUTER_API_KEY      OpenRouter API key (required for OpenRouter provider)
@@ -285,7 +315,10 @@ Examples:
   
   # Start MCP server with VoyageAI and specific model
   EMBEDDING_PROVIDER=VoyageAI VOYAGEAI_API_KEY=pa-xxx EMBEDDING_MODEL=voyage-3-large MILVUS_TOKEN=your-token npx @zilliz/claude-context-mcp@latest
-  
+
+  # Start MCP server with VoyageAI dual-key mode (free for search/incremental, paid for full indexing + fallback)
+  EMBEDDING_PROVIDER=VoyageAI VOYAGEAI_API_KEY=pa-paid VOYAGEAI_API_KEY_FREE=pa-free EMBEDDING_MODEL=voyage-code-3 MILVUS_TOKEN=your-token npx @zilliz/claude-context-mcp@latest
+
   # Start MCP server with Gemini and specific model
   EMBEDDING_PROVIDER=Gemini GEMINI_API_KEY=xxx EMBEDDING_MODEL=gemini-embedding-001 MILVUS_TOKEN=your-token npx @zilliz/claude-context-mcp@latest
   

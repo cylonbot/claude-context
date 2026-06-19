@@ -39,14 +39,63 @@ export class MilvusVectorDatabase implements VectorDatabase {
 
     private async initializeClient(address: string): Promise<void> {
         const milvusConfig = this.config as MilvusConfig;
-        console.log('🔌 Connecting to vector database at: ', address);
+        const timeout = this.getClientTimeoutMs();
+        console.log(`🔌 Connecting to vector database at:  ${address} (timeout: ${timeout}ms)`);
         this.client = new MilvusClient({
             address: address,
             username: milvusConfig.username,
             password: milvusConfig.password,
             token: milvusConfig.token,
             ssl: milvusConfig.ssl || false,
+            timeout,
         });
+    }
+
+    /**
+     * Per-RPC timeout for the Milvus client. The SDK default (~15s) is too short for
+     * serverless cold-starts (e.g. Zilliz), so default to 60s and allow override via
+     * MILVUS_TIMEOUT_MS.
+     */
+    private getClientTimeoutMs(): number {
+        const raw = Number(process.env.MILVUS_TIMEOUT_MS);
+        return Number.isFinite(raw) && raw > 0 ? raw : 60000;
+    }
+
+    /** True for transient gRPC errors worth retrying (e.g. serverless cold-start). */
+    protected isTransientMilvusError(error: any): boolean {
+        const message = (error?.message ?? String(error ?? '')).toLowerCase();
+        return /deadline_exceeded|deadline exceeded|timeout|unavailable|econnreset|socket hang up/.test(message);
+    }
+
+    /**
+     * Run a one-shot Milvus gRPC call, retrying transient errors (deadline/unavailable)
+     * with exponential backoff. Used for collection setup calls (create/drop/has) so a
+     * cold-start doesn't fail the operation — and, for destructive sequences like force
+     * reindex (drop then create), doesn't leave the collection dropped-but-not-recreated.
+     */
+    protected async withTransientRetry<T>(
+        label: string,
+        op: () => Promise<T>,
+        maxRetries: number = 3,
+        initialInterval: number = 1000,
+        backoffMultiplier: number = 2
+    ): Promise<T> {
+        let interval = initialInterval;
+        for (let attempt = 1; attempt <= maxRetries; attempt++) {
+            try {
+                return await op();
+            } catch (error: any) {
+                if (attempt < maxRetries && this.isTransientMilvusError(error)) {
+                    console.warn(`[MilvusDB] ⏳ ${label} hit a transient error (attempt ${attempt}/${maxRetries}): ${error?.message || error}. Retrying in ${interval}ms...`);
+                    await new Promise(resolve => setTimeout(resolve, interval));
+                    interval *= backoffMultiplier;
+                    continue;
+                }
+                throw error;
+            }
+        }
+        // Unreachable: the loop either returns a value or throws.
+        throw new Error(`${label} failed after ${maxRetries} attempts`);
     }
 
     /**
@@ -276,8 +325,9 @@ export class MilvusVectorDatabase implements VectorDatabase {
         if (!this.client) {
             throw new Error('MilvusClient is not initialized. Call ensureInitialized() first.');
         }
+        const client = this.client;
 
-        await this.client.createCollection(createCollectionParams);
+        await this.withTransientRetry('createCollection', () => client.createCollection(createCollectionParams));
 
         // Create index
         const indexParams = {
@@ -289,7 +339,7 @@ export class MilvusVectorDatabase implements VectorDatabase {
         };
 
         console.log(`[MilvusDB] 🔧 Creating index for field 'vector' in collection '${collectionName}'...`);
-        await this.client.createIndex(indexParams);
+        await this.withTransientRetry('createIndex', () => client.createIndex(indexParams));
 
         // Wait for index to be ready before loading collection
         await this.waitForIndexReady(collectionName, 'vector');
@@ -298,9 +348,9 @@ export class MilvusVectorDatabase implements VectorDatabase {
         await this.loadCollectionWithRetry(collectionName);
 
         // Verify collection is created correctly
-        await this.client.describeCollection({
+        await this.withTransientRetry('describeCollection', () => client.describeCollection({
             collection_name: collectionName,
-        });
+        }));
     }
 
     async dropCollection(collectionName: string): Promise<void> {
@@ -309,10 +359,11 @@ export class MilvusVectorDatabase implements VectorDatabase {
         if (!this.client) {
             throw new Error('MilvusClient is not initialized after ensureInitialized().');
         }
+        const client = this.client;
 
-        await this.client.dropCollection({
+        await this.withTransientRetry('dropCollection', () => client.dropCollection({
             collection_name: collectionName,
-        });
+        }));
     }
 
     async hasCollection(collectionName: string): Promise<boolean> {
@@ -321,10 +372,11 @@ export class MilvusVectorDatabase implements VectorDatabase {
         if (!this.client) {
             throw new Error('MilvusClient is not initialized after ensureInitialized().');
         }
+        const client = this.client;
 
-        const result = await this.client.hasCollection({
+        const result = await this.withTransientRetry('hasCollection', () => client.hasCollection({
             collection_name: collectionName,
-        });
+        }));
 
         return Boolean(result.value);
     }

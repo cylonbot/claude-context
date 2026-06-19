@@ -1,5 +1,5 @@
 import { GoogleGenAI } from '@google/genai';
-import { Embedding, EmbeddingVector } from './base-embedding';
+import { Embedding, EmbeddingVector, EmbedOptions } from './base-embedding';
 
 type GeminiModelInfo = {
     dimension: number;
@@ -61,7 +61,7 @@ export class GeminiEmbedding extends Embedding {
         return this.dimension;
     }
 
-    async embed(text: string): Promise<EmbeddingVector> {
+    async embed(text: string, _options?: EmbedOptions): Promise<EmbeddingVector> {
         const processedText = this.preprocessText(text);
         const model = this.config.model || 'gemini-embedding-001';
 
@@ -72,7 +72,7 @@ export class GeminiEmbedding extends Embedding {
         }
     }
 
-    async embedBatch(texts: string[]): Promise<EmbeddingVector[]> {
+    async embedBatch(texts: string[], _options?: EmbedOptions): Promise<EmbeddingVector[]> {
         if (texts.length === 0) {
             return [];
         }

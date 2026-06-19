@@ -5,6 +5,7 @@ import { Context, FileSynchronizer, envManager } from "@zilliz/claude-context-co
 import { SnapshotManager } from "./snapshot.js";
 import type { RequestSplitterType } from "./config.js";
 import { createRequestSplitter, resolveRequestSplitterType } from "./splitter.js";
+import { syncLog, computeSyncStats24h } from "./sync-log.js";
 
 const DEFAULT_INITIAL_SYNC_DELAY_MS = 5_000;
 const DEFAULT_SYNC_INTERVAL_MS = 5 * 60 * 1000;
@@ -31,7 +32,7 @@ function isBackgroundSyncEnabled(): boolean {
             return false;
         default:
             console.warn(
-                `[SYNC-DEBUG] Invalid CLAUDE_CONTEXT_BACKGROUND_SYNC value '${value}'. ` +
+                `[MCP] ⚠️  Invalid CLAUDE_CONTEXT_BACKGROUND_SYNC value '${value}'. ` +
                 "Expected true/false. Background sync will remain enabled."
             );
             return true;
@@ -47,7 +48,7 @@ function getBackgroundSyncIntervalMs(): number {
     const intervalMs = Number.parseInt(value, 10);
     if (!Number.isFinite(intervalMs) || intervalMs < MIN_SYNC_INTERVAL_MS) {
         console.warn(
-            `[SYNC-DEBUG] Invalid CLAUDE_CONTEXT_SYNC_INTERVAL_MS value '${value}'. ` +
+            `[MCP] ⚠️  Invalid CLAUDE_CONTEXT_SYNC_INTERVAL_MS value '${value}'. ` +
             `Falling back to ${DEFAULT_SYNC_INTERVAL_MS}ms.`
         );
         return DEFAULT_SYNC_INTERVAL_MS;
@@ -56,11 +57,17 @@ function getBackgroundSyncIntervalMs(): number {
     return intervalMs;
 }
 
+// Refresh the lock ~HEARTBEAT_DIVISOR times per stale window, so up to (divisor - 1)
+// consecutive missed heartbeats are tolerated before another process reclaims it.
+const SYNC_LOCK_HEARTBEAT_DIVISOR = 3;
+const SYNC_LOCK_HEARTBEAT_MIN_MS = 15_000;
+
 export class SyncManager {
     private context: Context;
     private snapshotManager: SnapshotManager;
     private isSyncing: boolean = false;
     private syncLockToken: string | null = null;
+    private syncLockHeartbeat: NodeJS.Timeout | null = null;
     private triggerWatcher: fs.FSWatcher | null = null;
     private triggerDebounceTimer: NodeJS.Timeout | null = null;
 
@@ -81,7 +88,7 @@ export class SyncManager {
 
         const staleMs = Number.parseInt(value, 10);
         if (!Number.isFinite(staleMs) || staleMs <= 0) {
-            console.warn(`[SYNC-DEBUG] Invalid ${SYNC_LOCK_STALE_ENV} value '${value}'. Falling back to ${DEFAULT_SYNC_LOCK_STALE_MS}ms.`);
+            console.warn(`[MCP] ⚠️  Invalid ${SYNC_LOCK_STALE_ENV} value '${value}'. Falling back to ${DEFAULT_SYNC_LOCK_STALE_MS}ms.`);
             return DEFAULT_SYNC_LOCK_STALE_MS;
         }
 
@@ -102,7 +109,9 @@ export class SyncManager {
                 acquiredAt: new Date().toISOString()
             }, null, 2));
             this.syncLockToken = token;
+            this.startSyncLockHeartbeat(lockPath, staleMs);
             console.log(`[SYNC-DEBUG] Acquired global sync lock: ${lockPath}`);
+            syncLog(`lock ACQUIRED`);
             return true;
         } catch (error: any) {
             if (error?.code !== "EEXIST") {
@@ -125,7 +134,9 @@ export class SyncManager {
                         recoveredStaleLock: true
                     }, null, 2));
                     this.syncLockToken = token;
+                    this.startSyncLockHeartbeat(lockPath, staleMs);
                     console.log(`[SYNC-DEBUG] Acquired global sync lock after stale cleanup: ${lockPath}`);
+                    syncLog(`lock RECLAIMED (previous owner went stale)`);
                     return true;
                 }
             } catch (statError: any) {
@@ -133,11 +144,56 @@ export class SyncManager {
             }
 
             console.log("[SYNC-DEBUG] Another MCP process is already syncing. Skipping this cycle.");
+            syncLog(`lock BUSY — another process holds it, skipping this cycle`);
             return false;
         }
     }
 
+    /**
+     * Keep the global sync lock fresh while this process is actively syncing, so a
+     * slow-but-alive sync (e.g. incremental indexing paced on a rate-limited key) is
+     * not reclaimed as "stale" by another MCP process. Without this, multiple MCP
+     * instances livelock: they keep stealing each other's lock every staleMs and
+     * trample the embedding work, so no sync ever reaches commit.
+     *
+     * The heartbeat fires from the event loop between awaits; if the process truly
+     * hangs or dies it stops firing and the lock is allowed to go stale (correct).
+     */
+    private startSyncLockHeartbeat(lockPath: string, staleMs: number): void {
+        this.stopSyncLockHeartbeat();
+        const intervalMs = Math.max(SYNC_LOCK_HEARTBEAT_MIN_MS, Math.floor(staleMs / SYNC_LOCK_HEARTBEAT_DIVISOR));
+        const heartbeat = setInterval(() => {
+            try {
+                const ownerPath = path.join(lockPath, "owner.json");
+                const owner = JSON.parse(fs.readFileSync(ownerPath, "utf8"));
+                if (owner.token !== this.syncLockToken) {
+                    // Lost ownership (another process reclaimed it) — stop refreshing.
+                    this.stopSyncLockHeartbeat();
+                    return;
+                }
+                const now = new Date();
+                fs.utimesSync(lockPath, now, now);
+                syncLog(`lock heartbeat (still syncing)`);
+            } catch {
+                // Lock vanished or unreadable; nothing to refresh.
+                this.stopSyncLockHeartbeat();
+            }
+        }, intervalMs);
+        if (typeof heartbeat.unref === "function") {
+            heartbeat.unref(); // don't keep the process alive just for the heartbeat
+        }
+        this.syncLockHeartbeat = heartbeat;
+    }
+
+    private stopSyncLockHeartbeat(): void {
+        if (this.syncLockHeartbeat) {
+            clearInterval(this.syncLockHeartbeat);
+            this.syncLockHeartbeat = null;
+        }
+    }
+
     private releaseGlobalSyncLock(): void {
+        this.stopSyncLockHeartbeat();
         const lockPath = this.getSyncLockPath();
         try {
             const ownerPath = path.join(lockPath, "owner.json");
@@ -151,8 +207,25 @@ export class SyncManager {
             fs.rmSync(lockPath, { recursive: true, force: true });
             this.syncLockToken = null;
             console.log(`[SYNC-DEBUG] Released global sync lock: ${lockPath}`);
+            syncLog(`lock RELEASED`);
         } catch (error: any) {
             console.warn(`[SYNC-DEBUG] Failed to release global sync lock: ${error?.message || String(error)}`);
+        }
+    }
+
+    /**
+     * Synchronously release the global sync lock (if held by this process) on shutdown.
+     * Wired into the process exit handlers so a killed/restarted MCP doesn't leave an
+     * orphaned lock that blocks other instances until it goes stale. `process.exit()`
+     * skips pending `finally` blocks, so the lock must be released here explicitly. Safe
+     * to call always — release only removes the lock when we still own its token.
+     */
+    public releaseLockForShutdown(): void {
+        try {
+            syncLog(`shutdown — releasing lock if held`);
+            this.releaseGlobalSyncLock();
+        } catch {
+            // best-effort during shutdown
         }
     }
 
@@ -180,6 +253,7 @@ export class SyncManager {
 
         this.isSyncing = true;
         console.log(`[SYNC-DEBUG] Starting index sync for all ${indexedCodebases.length} codebases...`);
+        syncLog(`sync START — ${indexedCodebases.length} codebase(s)`);
 
         try {
             let totalStats = { added: 0, removed: 0, modified: 0 };
@@ -206,19 +280,28 @@ export class SyncManager {
 
                 try {
                     console.log(`[SYNC-DEBUG] Calling context.reindexByChange() for '${codebasePath}'`);
+                    syncLog(`reindexByChange START '${path.basename(codebasePath)}'`);
                     const codebaseInfo = this.snapshotManager.getCodebaseInfo(codebasePath);
                     const requestSplitterType: RequestSplitterType = resolveRequestSplitterType(codebaseInfo?.requestSplitter);
                     const requestIgnorePatterns = codebaseInfo?.requestIgnorePatterns || [];
                     const requestCustomExtensions = codebaseInfo?.requestCustomExtensions || [];
+                    let lastPhase = '';
                     const stats = await this.context.reindexByChange(
                         codebasePath,
-                        undefined,
+                        (progress) => {
+                            // Log each distinct phase so a stuck/slow file is visible in the log.
+                            if (progress.phase !== lastPhase) {
+                                lastPhase = progress.phase;
+                                syncLog(`  [${progress.percentage}%] ${progress.phase}`);
+                            }
+                        },
                         requestIgnorePatterns,
                         requestCustomExtensions,
                         createRequestSplitter(requestSplitterType)
                     );
                     const codebaseElapsed = Date.now() - codebaseStartTime;
 
+                    syncLog(`reindexByChange DONE '${path.basename(codebasePath)}' added=${stats.added} removed=${stats.removed} modified=${stats.modified} in ${codebaseElapsed}ms`);
                     console.log(`[SYNC-DEBUG] Reindex stats for '${codebasePath}':`, stats);
                     console.log(`[SYNC-DEBUG] Codebase sync completed in ${codebaseElapsed}ms`);
 
@@ -234,6 +317,7 @@ export class SyncManager {
                     }
                 } catch (error: any) {
                     const codebaseElapsed = Date.now() - codebaseStartTime;
+                    syncLog(`reindexByChange ERROR '${path.basename(codebasePath)}' after ${codebaseElapsed}ms: ${error?.message || error}`);
                     console.error(`[SYNC-DEBUG] Error syncing codebase '${codebasePath}' after ${codebaseElapsed}ms:`, error);
                     console.error(`[SYNC-DEBUG] Error stack:`, error.stack);
 
@@ -266,6 +350,8 @@ export class SyncManager {
             this.isSyncing = false;
             this.releaseGlobalSyncLock();
             const totalElapsed = Date.now() - syncStartTime;
+            syncLog(`sync FINISHED in ${totalElapsed}ms`);
+            syncLog(computeSyncStats24h());
             console.log(`[SYNC-DEBUG] handleSyncIndex() finished at ${new Date().toISOString()}, total duration: ${totalElapsed}ms`);
         }
     }
@@ -321,7 +407,7 @@ export class SyncManager {
         if (['1', 'true', 'yes', 'on'].includes(v)) return true;
         if (['0', 'false', 'no', 'off'].includes(v)) return false;
         console.warn(
-            `[SYNC-DEBUG] Invalid CLAUDE_CONTEXT_TRIGGER_WATCHER value '${v}'. ` +
+            `[MCP] ⚠️  Invalid CLAUDE_CONTEXT_TRIGGER_WATCHER value '${v}'. ` +
             'Expected true/false. Trigger watcher will remain enabled.'
         );
         return true;

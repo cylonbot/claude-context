@@ -72,12 +72,33 @@ See `getSupportedModels` in [`openai-embedding.ts`](https://github.com/zilliztec
 VoyageAI offers specialized code embeddings optimized for programming languages.
 
 ```bash
-# Required: Your VoyageAI API key
+# Required: Your VoyageAI API key (paid/commercial — used for full indexing and as search fallback)
 VOYAGEAI_API_KEY=pa-your-voyageai-api-key
 
 # Optional: Specify embedding model (default: voyage-code-3)
 EMBEDDING_MODEL=voyage-code-3
 ```
+
+**Dual-key mode (free pool + paid):**
+
+This fork supports a **pool of free-tier VoyageAI keys** (comma-separated) plus the paid key, so you can route work by operation and avoid burning paid quota on routine work:
+
+```bash
+VOYAGEAI_API_KEY=pa-your-paid-key                 # paid / commercial key
+VOYAGEAI_API_KEY_FREE=pa-free-1,pa-free-2,pa-free-3   # pool of free keys (comma-separated, optional)
+VOYAGEAI_FREE_RPM=3                                # per-key free requests/min (default 3)
+VOYAGEAI_FREE_TPM=10000                            # per-key free tokens/min   (default 10000)
+```
+
+Each free key gets its own RPM/TPM window. When `VOYAGEAI_API_KEY_FREE` has at least one key, work is routed per operation:
+
+| Operation | Key | Behavior |
+|---|---|---|
+| **Search** | free pool → paid | Uses any free key that still has per-minute budget; only when **all** free keys are at their budget (or a real 429) does the query go to the paid key. |
+| **Incremental indexing** (background sync) | free pool only | Fans out across the free keys — one concurrent worker per key, each paced on its own window — so N keys ≈ N× throughput. Conservative sub-batch sizing + adaptive-split-on-429 + patient retry make it slow-but-reliable; never falls back to paid. |
+| **Full indexing** (`index_codebase`) | paid only | Always the paid key, no throttling. |
+
+If `VOYAGEAI_API_KEY_FREE` is empty, every operation uses `VOYAGEAI_API_KEY` (upstream behavior). Progress is written to `~/.context/sync.log` (`CLAUDE_CONTEXT_SYNC_LOG` to override).
 
 **Available Models:**
 See `getSupportedModels` in [`voyageai-embedding.ts`](https://github.com/zilliztech/claude-context/blob/master/packages/core/src/embedding/voyageai-embedding.ts) for the full list of supported models.
@@ -368,7 +389,8 @@ Pasting the following configuration into your Cursor `~/.cursor/mcp.json` file i
       "args": ["-y", "@zilliz/claude-context-mcp@latest"],
       "env": {
         "EMBEDDING_PROVIDER": "VoyageAI",
-        "VOYAGEAI_API_KEY": "your-voyageai-api-key",
+        "VOYAGEAI_API_KEY": "your-paid-voyageai-api-key",
+        "VOYAGEAI_API_KEY_FREE": "your-free-voyageai-api-key",
         "EMBEDDING_MODEL": "voyage-code-3",
         "MILVUS_TOKEN": "your-zilliz-cloud-api-key"
       }

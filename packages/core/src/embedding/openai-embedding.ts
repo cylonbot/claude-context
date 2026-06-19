@@ -1,5 +1,5 @@
 import OpenAI from 'openai';
-import { Embedding, EmbeddingVector } from './base-embedding';
+import { Embedding, EmbeddingVector, EmbedOptions } from './base-embedding';
 
 export interface OpenAIEmbeddingConfig {
     model: string;
@@ -53,7 +53,7 @@ export class OpenAIEmbedding extends Embedding {
         }
     }
 
-    async embed(text: string): Promise<EmbeddingVector> {
+    async embed(text: string, _options?: EmbedOptions): Promise<EmbeddingVector> {
         const processedText = this.preprocessText(text);
         const model = this.config.model || 'text-embedding-3-small';
 
@@ -84,7 +84,7 @@ export class OpenAIEmbedding extends Embedding {
         }
     }
 
-    async embedBatch(texts: string[]): Promise<EmbeddingVector[]> {
+    async embedBatch(texts: string[], _options?: EmbedOptions): Promise<EmbeddingVector[]> {
         const processedTexts = this.preprocessTexts(texts);
         const model = this.config.model || 'text-embedding-3-small';
 

@@ -2,9 +2,6 @@
 
 // CRITICAL: Redirect console outputs to stderr IMMEDIATELY to avoid interfering with MCP JSON protocol
 // Only MCP protocol messages should go to stdout
-const originalConsoleLog = console.log;
-const originalConsoleWarn = console.warn;
-
 console.log = (...args: any[]) => {
     process.stderr.write('[LOG] ' + args.join(' ') + '\n');
 };
@@ -262,6 +259,26 @@ This tool is versatile and can be used before completing various tasks to retrie
         console.log("MCP server started and listening on stdio.");
         console.log('[SYNC-DEBUG] Server connection established successfully');
 
+        // Exit when the parent (the MCP client / Claude Code) disconnects, i.e. stdin
+        // closes. The background-sync timers otherwise keep this process alive forever,
+        // so a `/mcp` reconnect or a session close would ORPHAN this process — leaving a
+        // ghost that keeps running background sync and contends for the global sync lock.
+        // On the way out we also release the sync lock: process.exit() skips pending
+        // `finally` blocks, so a kill mid-sync would otherwise leave the lock held by a
+        // dead pid, blocking the next instance until it goes stale.
+        let shuttingDown = false;
+        const shutdown = (reason: string) => {
+            if (shuttingDown) return; // stdin 'end' + 'close' (and signals) can all fire — run once.
+            shuttingDown = true;
+            console.error(`Shutting down (${reason}) — releasing sync lock.`);
+            this.syncManager.releaseLockForShutdown();
+            process.exit(0);
+        };
+        process.stdin.on('end', () => shutdown('stdin closed'));
+        process.stdin.on('close', () => shutdown('stdin closed'));
+        process.on('SIGTERM', () => shutdown('SIGTERM'));
+        process.on('SIGINT', () => shutdown('SIGINT'));
+
         // Start background sync after server is connected
         console.log('[SYNC-DEBUG] Initializing background sync...');
         this.syncManager.startBackgroundSync();
@@ -288,16 +305,8 @@ async function main() {
     await server.start();
 }
 
-// Handle graceful shutdown
-process.on('SIGINT', () => {
-    console.error("Received SIGINT, shutting down gracefully...");
-    process.exit(0);
-});
-
-process.on('SIGTERM', () => {
-    console.error("Received SIGTERM, shutting down gracefully...");
-    process.exit(0);
-});
+// Graceful shutdown (SIGINT/SIGTERM/stdin-close) is wired inside ContextMcpServer.start(),
+// where it can release the global sync lock before exiting.
 
 // Always start the server - this is designed to be the main entry point
 main().catch((error) => {
