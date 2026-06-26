@@ -1,4 +1,4 @@
-import { OpenAIEmbedding, VoyageAIEmbedding, GeminiEmbedding, OllamaEmbedding, DEFAULT_FREE_RPM, DEFAULT_FREE_TPM } from "@zilliz/claude-context-core";
+import { OpenAIEmbedding, VoyageAIEmbedding, GeminiEmbedding, OllamaEmbedding } from "@zilliz/claude-context-core";
 import { ContextMcpConfig } from "./config.js";
 import { syncLog } from "./sync-log.js";
 
@@ -27,12 +27,14 @@ export function createEmbeddingInstance(config: ContextMcpConfig): OpenAIEmbeddi
                 throw new Error('VOYAGEAI_API_KEY is required for VoyageAI embedding provider');
             }
             console.log(`[EMBEDDING] 🔧 Configuring VoyageAI with model: ${config.embeddingModel}${config.voyageaiApiKeyFree?.length ? ` (${config.voyageaiApiKeyFree.length} free key(s) + paid)` : ' (single paid key)'}`);
+            // Optional free-tier knobs are undefined when unset; the VoyageAIEmbedding constructor applies defaults via ??.
             const voyageEmbedding = new VoyageAIEmbedding({
                 apiKey: config.voyageaiApiKey,
                 model: config.embeddingModel,
-                ...(config.voyageaiApiKeyFree?.length && { freeApiKeys: config.voyageaiApiKeyFree }),
-                ...(config.voyageaiFreeRpm && { freeRpm: config.voyageaiFreeRpm }),
-                ...(config.voyageaiFreeTpm && { freeTpm: config.voyageaiFreeTpm }),
+                freeApiKeys: config.voyageaiApiKeyFree,   // [] → no free pool; constructor handles it
+                freeRpm: config.voyageaiFreeRpm,
+                freeTpm: config.voyageaiFreeTpm,
+                freeTpmSafety: config.voyageaiFreeTpmSafety,
                 logger: syncLog
             });
             console.log(`[EMBEDDING] ✅ VoyageAI embedding instance created successfully`);
@@ -96,7 +98,7 @@ export function logEmbeddingProviderInfo(config: ContextMcpConfig, embedding: Op
         case 'VoyageAI':
             console.log(`[EMBEDDING] VoyageAI configuration - Paid Key: ${config.voyageaiApiKey ? '✅ Provided' : '❌ Missing'}`);
             if (config.voyageaiApiKeyFree?.length) {
-                console.log(`[EMBEDDING] VoyageAI configuration - Free Keys: ✅ ${config.voyageaiApiKeyFree.length} (each ${config.voyageaiFreeRpm ?? DEFAULT_FREE_RPM} RPM / ${config.voyageaiFreeTpm ?? DEFAULT_FREE_TPM} TPM, incremental fans out)`);
+                console.log(`[EMBEDDING] VoyageAI configuration - Free Keys: ✅ ${config.voyageaiApiKeyFree.length} (search + incremental)`);
             } else {
                 console.log(`[EMBEDDING] VoyageAI configuration - Free Keys: ❌ None (all operations use the paid key)`);
             }

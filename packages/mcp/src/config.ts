@@ -13,6 +13,7 @@ export interface ContextMcpConfig {
     voyageaiApiKeyFree: string[];   // free key pool (VOYAGEAI_API_KEY_FREE, comma-separated; [] if unset)
     voyageaiFreeRpm?: number;       // free-tier requests per minute (default 3)
     voyageaiFreeTpm?: number;       // free-tier tokens per minute (default 10000)
+    voyageaiFreeTpmSafety?: number; // fraction of free TPM to pace/size against (default 0.7 → 7000 of 10000)
     geminiApiKey?: string;
     geminiBaseUrl?: string;
     // OpenRouter configuration
@@ -121,19 +122,30 @@ export function getEmbeddingModelForProvider(provider: string): string {
     }
 }
 
-function getPositiveIntegerFromEnv(name: string): number | undefined {
+/** Parse a numeric env var, accepting only values that pass `validate`; warns and returns undefined otherwise. */
+function getNumericFromEnv(name: string, validate: (n: number) => boolean, expected: string): number | undefined {
     const rawValue = envManager.get(name);
     if (!rawValue) {
         return undefined;
     }
 
     const parsedValue = Number(rawValue);
-    if (Number.isInteger(parsedValue) && parsedValue > 0) {
+    if (validate(parsedValue)) {
         return parsedValue;
     }
 
-    console.warn(`[MCP] ⚠️  Ignoring invalid ${name}: ${rawValue}. Expected a positive integer.`);
+    console.warn(`[MCP] ⚠️  Ignoring invalid ${name}: ${rawValue}. Expected ${expected}.`);
     return undefined;
+}
+
+/** Positive integer (e.g. VOYAGEAI_FREE_RPM / VOYAGEAI_FREE_TPM). */
+function getPositiveIntegerFromEnv(name: string): number | undefined {
+    return getNumericFromEnv(name, n => Number.isInteger(n) && n > 0, 'a positive integer');
+}
+
+/** Fraction in (0, 1] (e.g. VOYAGEAI_FREE_TPM_SAFETY). */
+function getFractionFromEnv(name: string): number | undefined {
+    return getNumericFromEnv(name, n => Number.isFinite(n) && n > 0 && n <= 1, 'a fraction in (0, 1]');
 }
 
 /** Parse a comma-separated list of API keys (e.g. VOYAGEAI_API_KEY_FREE) into a trimmed, non-empty array. */
@@ -171,6 +183,7 @@ export function createMcpConfig(): ContextMcpConfig {
         voyageaiApiKeyFree: voyageaiFreeKeys,
         voyageaiFreeRpm: getPositiveIntegerFromEnv('VOYAGEAI_FREE_RPM'),
         voyageaiFreeTpm: getPositiveIntegerFromEnv('VOYAGEAI_FREE_TPM'),
+        voyageaiFreeTpmSafety: getFractionFromEnv('VOYAGEAI_FREE_TPM_SAFETY'),
         geminiApiKey: envManager.get('GEMINI_API_KEY'),
         geminiBaseUrl: envManager.get('GEMINI_BASE_URL'),
         // OpenRouter configuration
@@ -212,6 +225,7 @@ export function logConfigurationSummary(config: ContextMcpConfig): void {
             console.log(`[MCP]   VoyageAI Paid Key (VOYAGEAI_API_KEY): ${config.voyageaiApiKey ? '✅ Configured' : '❌ Missing'}`);
             const freeCount = config.voyageaiApiKeyFree?.length ?? 0;
             if (freeCount > 0) {
+                // Concise config echo; effective pacing (~est-tokens/min @ safety) is logged once by the VoyageAI init log.
                 console.log(`[MCP]   VoyageAI Free Keys (VOYAGEAI_API_KEY_FREE): ✅ ${freeCount} key(s) (search + incremental; each ${config.voyageaiFreeRpm ?? DEFAULT_FREE_RPM} RPM / ${config.voyageaiFreeTpm ?? DEFAULT_FREE_TPM} TPM)`);
             } else {
                 console.log(`[MCP]   VoyageAI Free Keys (VOYAGEAI_API_KEY_FREE): ❌ None — all operations use the paid key`);
@@ -269,6 +283,10 @@ Environment Variables:
                           key. If unset, all operations use VOYAGEAI_API_KEY.
   VOYAGEAI_FREE_RPM       Per-key free requests-per-minute limit (default: 3).
   VOYAGEAI_FREE_TPM       Per-key free tokens-per-minute limit (default: 10000).
+  VOYAGEAI_FREE_TPM_SAFETY  Fraction of free TPM to actually pace/size incremental
+                          requests against, absorbing token-estimate error (default:
+                          0.7 → 7000 of 10000). Range (0, 1]. Raise toward 1 for more
+                          throughput, lower if you keep hitting the real per-minute cap.
   GEMINI_API_KEY          Google AI API key (required for Gemini provider)
   GEMINI_BASE_URL         Gemini API base URL (optional, for custom endpoints)
   OPENROUTER_API_KEY      OpenRouter API key (required for OpenRouter provider)

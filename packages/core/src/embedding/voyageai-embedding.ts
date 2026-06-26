@@ -17,7 +17,7 @@ export interface VoyageAIEmbeddingConfig {
     freeTpm?: number;
     /** Patience for a single chunk that keeps hitting 429 on the free key (default 100 window-waits). */
     incrementalMaxRetries?: number;
-    /** Fraction of the real free TPM we actually pace/size against, to absorb token-estimate error (default 0.6). */
+    /** Fraction of the real free TPM we actually pace/size against, to absorb token-estimate error (default 0.7). */
     freeTpmSafety?: number;
     /** Optional sink for incremental embedding progress (e.g. wired to the MCP sync log file). */
     logger?: (message: string) => void;
@@ -28,7 +28,7 @@ export const DEFAULT_FREE_TPM = 10000;
 // High by design: this is per-single-chunk patience (each retry waits a full window), NOT a
 // "give up on the batch" cap. Background incremental should keep pausing-and-retrying, not fail.
 const DEFAULT_INCREMENTAL_MAX_RETRIES = 100;
-const DEFAULT_FREE_TPM_SAFETY = 0.6;
+export const DEFAULT_FREE_TPM_SAFETY = 0.7;
 
 export class VoyageAIEmbedding extends Embedding {
     /** Paid client — full indexing + search fallback. */
@@ -76,7 +76,7 @@ export class VoyageAIEmbedding extends Embedding {
         this.hasFree = this.freePool.length > 0;
 
         if (this.hasFree) {
-            console.log(`[VoyageAI] 🔑 Dual-key mode: ${this.freePool.length} free key(s) (search + incremental, each ${freeRpm} RPM / ${this.freeTpm} TPM, pacing ~${this.effectiveFreeTpm} est-tokens/min; incremental fans out across them) + paid key (full indexing + search fallback)`);
+            console.log(`[VoyageAI] 🔑 Dual-key mode: ${this.freePool.length} free key(s) (search + incremental, each ${freeRpm} RPM / ${this.freeTpm} TPM, pacing ~${this.effectiveFreeTpm} est-tokens/min @ safety ${safety}; incremental fans out across them) + paid key (full indexing + search fallback)`);
         } else {
             console.warn(`[VoyageAI] ⚠️  No VOYAGEAI_API_KEY_FREE provided — all operations use the single paid key (VOYAGEAI_API_KEY)`);
         }

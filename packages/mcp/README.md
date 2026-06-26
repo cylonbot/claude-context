@@ -88,6 +88,7 @@ VOYAGEAI_API_KEY=pa-your-paid-key                 # paid / commercial key
 VOYAGEAI_API_KEY_FREE=pa-free-1,pa-free-2,pa-free-3   # pool of free keys (comma-separated, optional)
 VOYAGEAI_FREE_RPM=3                                # per-key free requests/min (default 3)
 VOYAGEAI_FREE_TPM=10000                            # per-key free tokens/min   (default 10000)
+VOYAGEAI_FREE_TPM_SAFETY=0.7                        # fraction of free TPM to pace incremental against (default 0.7)
 ```
 
 Each free key gets its own RPM/TPM window. When `VOYAGEAI_API_KEY_FREE` has at least one key, work is routed per operation:

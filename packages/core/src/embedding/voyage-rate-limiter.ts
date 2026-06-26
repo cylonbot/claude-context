@@ -115,13 +115,20 @@ export class SlidingWindowRateLimiter {
         // Symmetric with wouldExceed — an empty window never blocks on tokens.
         const used = this.usedTokens();
         if (this.records.length > 0 && used + tokens > this.maxTokens) {
-            let freed = 0;
-            const needed = used + tokens - this.maxTokens;
-            for (const rec of this.records) {
-                freed += rec.tokens;
-                if (freed >= needed) {
-                    waitUntil = Math.max(waitUntil, rec.ts + this.windowMs);
-                    break;
+            if (tokens > this.maxTokens) {
+                // Oversized request: it alone exceeds the whole per-window token budget, so wouldExceed
+                // keeps blocking until the window is completely empty. Dropping a subset never frees
+                // enough, so wait for the newest record to age out instead of spin-polling every 50ms.
+                waitUntil = Math.max(waitUntil, this.records[this.records.length - 1].ts + this.windowMs);
+            } else {
+                let freed = 0;
+                const needed = used + tokens - this.maxTokens;
+                for (const rec of this.records) {
+                    freed += rec.tokens;
+                    if (freed >= needed) {
+                        waitUntil = Math.max(waitUntil, rec.ts + this.windowMs);
+                        break;
+                    }
                 }
             }
         }
