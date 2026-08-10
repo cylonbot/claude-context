@@ -39,11 +39,22 @@ export abstract class Embedding {
         // Simple character-based truncation (approximation)
         // Each token is roughly 4 characters on average for English text
         const maxChars = this.maxTokens * 4;
-        if (text.length > maxChars) {
-            return text.substring(0, maxChars);
-        }
+        const truncated = text.length > maxChars ? text.substring(0, maxChars) : text;
 
-        return text;
+        return Embedding.replaceLoneSurrogates(truncated);
+    }
+
+    /**
+     * Replace unpaired surrogates with U+FFFD.
+     *
+     * A chunk can end mid-astral-character — one emoji in a comment landing on a split point
+     * is enough, and the truncation above cuts by UTF-16 unit too. The resulting string has no
+     * valid UTF-8 encoding, so the request body is malformed and the provider rejects the whole
+     * batch (VoyageAI answers 400 "ensure that your input is encoded in valid UTF-8"), which
+     * aborts the entire indexing run over a single split emoji.
+     */
+    private static replaceLoneSurrogates(text: string): string {
+        return text.replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '�');
     }
 
     /**
@@ -90,4 +101,15 @@ export abstract class Embedding {
      * @returns Provider name
      */
     abstract getProvider(): string;
-} 
+
+    /**
+     * Model identifier this instance embeds with. Used to bind an index to the model that
+     * produced it: vectors from two different models are not comparable even when their
+     * dimensions match, and that mismatch is otherwise invisible at query time.
+     * Providers override this; the fallback only makes index naming coarser, never wrong.
+     * @returns Model name
+     */
+    getModel(): string {
+        return 'default';
+    }
+}

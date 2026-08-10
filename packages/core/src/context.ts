@@ -52,6 +52,22 @@ export class EmbeddingError extends Error {
     }
 }
 
+/**
+ * Thrown by reindexByChange when the codebase has a file snapshot but no collection to
+ * sync into — typically because the embedding provider/model changed and the index now
+ * resolves to a different collection name.
+ *
+ * Incremental sync must never paper over this: the snapshot would keep reporting "no
+ * changes" against a collection that does not exist, leaving the codebase silently
+ * unsearchable. Failing loudly puts the (expensive) decision to re-embed back on the user.
+ */
+export class IndexMissingError extends Error {
+    constructor(message: string) {
+        super(message);
+        this.name = 'IndexMissingError';
+    }
+}
+
 const DEFAULT_SUPPORTED_EXTENSIONS = [
     // Programming languages
     '.ts', '.tsx', '.js', '.jsx', '.py', '.java', '.cpp', '.c', '.h', '.hpp',
@@ -129,6 +145,8 @@ export interface ContextConfig {
 
 export class Context {
     private static readonly MAX_COLLECTION_NAME_LENGTH = 255;
+    /** Every collection this tool creates starts with one of these (see getCollectionName). */
+    private static readonly COLLECTION_NAME_PREFIXES = ['code_chunks_', 'hybrid_code_chunks_'];
 
     private embedding: Embedding;
     private vectorDatabase: VectorDatabase;
@@ -283,29 +301,75 @@ export class Context {
     }
 
     /**
-     * Generate collection name based on codebase path and hybrid mode
+     * Generate collection name based on codebase path, hybrid mode and embedding model
      */
     public getCollectionName(codebasePath: string): string {
         const isHybrid = this.getIsHybrid();
         const prefix = isHybrid === true ? 'hybrid_code_chunks' : 'code_chunks';
-        const normalizedPath = path.resolve(codebasePath);
-        const pathHash = crypto.createHash('md5').update(normalizedPath).digest('hex').substring(0, 8);
+        const suffixHashes = `${this.getPathHash(codebasePath)}_${this.getEmbeddingHash()}`;
 
-        // Overrides always keep the per-codebase `_<pathHash>` suffix so that multiple
-        // codebases indexed by the same MCP server can't collapse into one collection.
+        // Overrides always keep the trailing hashes so that neither two codebases indexed by
+        // the same MCP server nor two embedding models can collapse into one collection.
         const configOverride = this.getValidOverrideValue(this.collectionNameOverride);
         if (configOverride) {
-            const suffix = this.sanitizeCollectionNameSuffix(configOverride, prefix, pathHash, 'Context config');
+            const suffix = this.sanitizeCollectionNameSuffix(configOverride, prefix, suffixHashes, 'Context config');
             return `${prefix}_${suffix}`;
         }
 
         const envOverride = this.getValidOverrideValue(envManager.get('CODE_CHUNKS_COLLECTION_NAME_OVERRIDE'));
         if (envOverride) {
-            const suffix = this.sanitizeCollectionNameSuffix(envOverride, prefix, pathHash, 'CODE_CHUNKS_COLLECTION_NAME_OVERRIDE');
+            const suffix = this.sanitizeCollectionNameSuffix(envOverride, prefix, suffixHashes, 'CODE_CHUNKS_COLLECTION_NAME_OVERRIDE');
             return `${prefix}_${suffix}`;
         }
 
-        return `${prefix}_${pathHash}`;
+        return `${prefix}_${suffixHashes}`;
+    }
+
+    private getPathHash(codebasePath: string): string {
+        return crypto.createHash('md5').update(path.resolve(codebasePath)).digest('hex').substring(0, 8);
+    }
+
+    /**
+     * Every collection in the vector DB that belongs to this codebase, whatever embedding
+     * model, hybrid setting or name override produced it.
+     *
+     * Old names cannot be reconstructed — the config that built them (model, HYBRID_MODE,
+     * CODE_CHUNKS_COLLECTION_NAME_OVERRIDE) may all have changed since. The `_<pathHash>`
+     * segment is the one part that survives, so it is what we match on.
+     *
+     * Returns [] rather than throwing if the vector DB cannot list collections: this only
+     * ever drives cleanup and diagnostics, and losing those must not fail the operation.
+     */
+    private async findCodebaseCollections(codebasePath: string): Promise<string[]> {
+        const pathHash = this.getPathHash(codebasePath);
+        try {
+            const collections = await this.vectorDatabase.listCollections();
+            return collections.filter(name =>
+                Context.COLLECTION_NAME_PREFIXES.some(prefix => name.startsWith(prefix))
+                && name.includes(`_${pathHash}`)
+            );
+        } catch (error) {
+            console.warn(`[Context] ⚠️  Could not list collections to find stale indexes for ${codebasePath}:`, error);
+            return [];
+        }
+    }
+
+    /**
+     * Short hash of the embedding identity (provider + model).
+     *
+     * Vectors from two different models are not comparable, and a dimension check does not
+     * catch the switch: models routinely share a dimension (1024 is the default across most
+     * of the Voyage line), so re-indexing with a new model would write into the same
+     * collection next to the old vectors and searches would silently return garbage. Binding
+     * the collection name to the model makes a switch land in a fresh collection instead.
+     *
+     * Deliberately excludes the dimension: some providers detect it lazily on the first API
+     * call, which would make the collection name change mid-run. A dimension change with the
+     * same model fails loudly at insert time anyway.
+     */
+    private getEmbeddingHash(): string {
+        const signature = `${this.embedding.getProvider()}:${this.embedding.getModel()}`;
+        return crypto.createHash('md5').update(signature).digest('hex').substring(0, 6);
     }
 
     private getValidOverrideValue(value?: string): string | undefined {
@@ -316,9 +380,9 @@ export class Context {
         return trimmed.length > 0 ? trimmed : undefined;
     }
 
-    private sanitizeCollectionNameSuffix(value: string, prefix: string, pathHash: string, source: string): string {
-        const hashSuffix = `_${pathHash}`;
-        // Leave room for both the prefix and the trailing `_<pathHash>` disambiguator.
+    private sanitizeCollectionNameSuffix(value: string, prefix: string, hashes: string, source: string): string {
+        const hashSuffix = `_${hashes}`;
+        // Leave room for both the prefix and the trailing `_<pathHash>_<embeddingHash>` disambiguator.
         const maxReadableLength = Context.MAX_COLLECTION_NAME_LENGTH - `${prefix}_`.length - hashSuffix.length;
         const normalized = value.trim();
         let sanitized = normalized.replace(/[^A-Za-z0-9_]/g, '_');
@@ -435,6 +499,22 @@ export class Context {
         requestSplitter?: Splitter
     ): Promise<{ added: number, removed: number, modified: number }> {
         const collectionName = this.getCollectionName(codebasePath);
+
+        // The file snapshot this sync trusts is keyed by codebase path alone, while the
+        // collection is keyed by path AND embedding identity. Change the embedding model and
+        // the two stop describing the same index: the snapshot still says "everything is
+        // synced" while the collection it now points at does not exist. Syncing on that would
+        // report "no changes" forever and quietly leave the codebase unsearchable, so stop
+        // here instead — re-embedding a whole codebase is the user's call, not ours.
+        if (!await this.vectorDatabase.hasCollection(collectionName)) {
+            throw new IndexMissingError(
+                `No index found for '${codebasePath}' (collection '${collectionName}' does not exist). ` +
+                `The current embedding is ${this.embedding.getProvider()}/${this.embedding.getModel()} — if that changed since indexing, ` +
+                `the old index lives under a different collection and cannot be reused: vectors from another model are not comparable. ` +
+                `Run clear_index to drop the stale index, then index_codebase to rebuild it (this re-embeds the whole codebase).`
+            );
+        }
+
         const synchronizer = this.synchronizers.get(collectionName);
         const splitter = requestSplitter || this.codeSplitter;
 
@@ -703,13 +783,24 @@ export class Context {
 
         progressCallback?.({ phase: 'Checking existing index...', current: 0, total: 100, percentage: 0 });
 
+        // Clearing "the index for this codebase" means every index this tool built for it,
+        // not just the one the current config points at. Indexes left behind by an earlier
+        // embedding model, hybrid setting or name override are unreachable but still occupy
+        // a slot in the vector DB's collection quota, so this is the only chance to free them.
+        // The current name is included explicitly as a safety net in case listing fails.
         const collectionName = this.getCollectionName(codebasePath);
-        const collectionExists = await this.vectorDatabase.hasCollection(collectionName);
+        const collectionNames = new Set(await this.findCodebaseCollections(codebasePath));
+        collectionNames.add(collectionName);
 
         progressCallback?.({ phase: 'Removing index data...', current: 50, total: 100, percentage: 50 });
 
-        if (collectionExists) {
-            await this.vectorDatabase.dropCollection(collectionName);
+        for (const name of collectionNames) {
+            if (await this.vectorDatabase.hasCollection(name)) {
+                if (name !== collectionName) {
+                    console.log(`[Context] 🗑️  Dropping stale collection ${name} (built with a different embedding/config)`);
+                }
+                await this.vectorDatabase.dropCollection(name);
+            }
         }
 
         // Delete snapshot file
@@ -816,6 +907,16 @@ export class Context {
         }
 
         console.log(`[Context] ✅ Collection ${collectionName} created successfully (dimension: ${dimension})`);
+
+        // Indexes this codebase had under a previous embedding model / hybrid setting / name
+        // override are unreachable from the current config but still occupy a slot in the
+        // vector DB's collection quota. Say so out loud — dropping them is the user's call
+        // (clear_index does it).
+        const staleCollections = (await this.findCodebaseCollections(codebasePath))
+            .filter(name => name !== collectionName);
+        if (staleCollections.length > 0) {
+            console.warn(`[Context] ⚠️  This codebase still has ${staleCollections.length} unused collection(s) from a previous embedding/config: ${staleCollections.join(', ')}. Run clear_index (then re-index) to free those collection slots.`);
+        }
     }
 
     /**

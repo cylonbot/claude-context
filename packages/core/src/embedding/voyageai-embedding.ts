@@ -44,13 +44,13 @@ export class VoyageAIEmbedding extends Embedding {
     private incrementalMaxRetries: number;
     private logger?: (message: string) => void;
     private model: string;
-    private dimension: number = 1024; // Default dimension for voyage-code-3
+    private dimension: number = 1024; // Default dimension for voyage-code-3.5
     private inputType: 'document' | 'query' = 'document';
     protected maxTokens: number = 32000; // Default max tokens
 
     constructor(config: VoyageAIEmbeddingConfig) {
         super();
-        this.model = config.model || 'voyage-code-3';
+        this.model = config.model || 'voyage-code-3.5';
         this.paidClient = new VoyageAIClient({ apiKey: config.apiKey });
 
         const freeRpm = config.freeRpm ?? DEFAULT_FREE_RPM;
@@ -99,12 +99,21 @@ export class VoyageAIEmbedding extends Embedding {
         return /\b429\b|too many requests|rate limit/.test(msg);
     }
 
-    /** Single network call + response validation. Works for both single and batch input. */
-    private async callEmbedRaw(client: VoyageAIClient, input: string | string[]): Promise<EmbeddingVector[]> {
+    /**
+     * Single network call + response validation. Works for both single and batch input.
+     * `inputType` defaults to the instance setting ('document' — the indexing path); the
+     * search path passes 'query' explicitly. Voyage is trained on that asymmetric pair, so
+     * embedding a question as if it were a document costs retrieval quality for free.
+     */
+    private async callEmbedRaw(
+        client: VoyageAIClient,
+        input: string | string[],
+        inputType: 'document' | 'query' = this.inputType
+    ): Promise<EmbeddingVector[]> {
         const response = await client.embed({
             input,
             model: this.model,
-            inputType: this.inputType,
+            inputType,
         });
 
         if (!response.data) {
@@ -222,10 +231,12 @@ export class VoyageAIEmbedding extends Embedding {
         const mode = options?.mode ?? 'search';
         const processedText = this.preprocessText(text);
         const tokens = this.estimateTokens(processedText);
+        // A search input is a question about code, not a piece of code — tell Voyage so.
+        const inputType: 'document' | 'query' = mode === 'search' ? 'query' : this.inputType;
 
         // Full indexing, or no distinct free key configured → always paid.
         if (mode === 'full' || !this.hasFree) {
-            return (await this.callEmbedRaw(this.paidClient, processedText))[0];
+            return (await this.callEmbedRaw(this.paidClient, processedText, inputType))[0];
         }
 
         // Incremental → free only, paced + resilient (never paid). Round-robin across the pool.
@@ -242,7 +253,7 @@ export class VoyageAIEmbedding extends Embedding {
                 continue;
             }
             try {
-                return (await this.callEmbedRaw(this.freePool[i].client, processedText))[0];
+                return (await this.callEmbedRaw(this.freePool[i].client, processedText, inputType))[0];
             } catch (err) {
                 if (this.isRateLimitError(err)) {
                     // This key was actually exhausted — shut its window and try the next free key.
@@ -253,7 +264,7 @@ export class VoyageAIEmbedding extends Embedding {
             }
         }
         // Every free key is at (or just hit) its per-minute budget → paid.
-        return (await this.callEmbedRaw(this.paidClient, processedText))[0];
+        return (await this.callEmbedRaw(this.paidClient, processedText, inputType))[0];
     }
 
     /**
@@ -297,6 +308,10 @@ export class VoyageAIEmbedding extends Embedding {
 
     getProvider(): string {
         return 'VoyageAI';
+    }
+
+    getModel(): string {
+        return this.model;
     }
 
     /**
@@ -365,10 +380,15 @@ export class VoyageAIEmbedding extends Embedding {
                 contextLength: 32000,
                 description: 'Optimized for latency and cost'
             },
-            'voyage-code-3': {
+            'voyage-code-3.5': {
                 dimension: '1024 (default), 256, 512, 2048',
                 contextLength: 32000,
                 description: 'Optimized for code retrieval (recommended for code)'
+            },
+            'voyage-code-3': {
+                dimension: '1024 (default), 256, 512, 2048',
+                contextLength: 32000,
+                description: 'Previous generation of code embeddings: use voyage-code-3.5 instead'
             },
             // Professional domain models
             'voyage-finance-2': {

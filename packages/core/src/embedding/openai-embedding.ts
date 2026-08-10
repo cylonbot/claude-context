@@ -5,6 +5,13 @@ export interface OpenAIEmbeddingConfig {
     model: string;
     apiKey: string;
     baseURL?: string; // OpenAI supports custom baseURL
+    /**
+     * Name this instance reports as its provider. This class also drives OpenAI-compatible
+     * endpoints (OpenRouter and friends), and callers must be able to tell those apart:
+     * the same model name served by a different backend is a different embedding, and the
+     * index is keyed on provider + model. Defaults to 'OpenAI'.
+     */
+    provider?: string;
 }
 
 export class OpenAIEmbedding extends Embedding {
@@ -131,7 +138,11 @@ export class OpenAIEmbedding extends Embedding {
     }
 
     getProvider(): string {
-        return 'OpenAI';
+        return this.config.provider || 'OpenAI';
+    }
+
+    getModel(): string {
+        return this.config.model || 'text-embedding-3-small';
     }
 
     /**

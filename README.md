@@ -484,7 +484,7 @@ For more detailed MCP environment variable configuration, see our [Environment V
 
 ### Using Different Embedding Models
 
-To configure custom embedding models (e.g., `text-embedding-3-large` for OpenAI, `voyage-code-3` for VoyageAI), see the [MCP Configuration Examples](packages/mcp/README.md#embedding-provider-configuration) for detailed setup instructions for each provider.
+To configure custom embedding models (e.g., `text-embedding-3-large` for OpenAI, `voyage-code-3.5` for VoyageAI), see the [MCP Configuration Examples](packages/mcp/README.md#embedding-provider-configuration) for detailed setup instructions for each provider.
 
 ### File Inclusion & Exclusion Rules
 

@@ -32,12 +32,38 @@ describe('VoyageAIEmbedding', () => {
         await expect(embedding.detectDimension()).resolves.toBe(1024);
     });
 
+    it('exposes voyage-code-3.5 as a supported code model', () => {
+        const embedding = new VoyageAIEmbedding({ apiKey: 'test-api-key', model: 'voyage-code-3.5' });
+
+        expect(embedding.getModel()).toBe('voyage-code-3.5');
+        expect(embedding.getDimension()).toBe(1024);
+        expect(VoyageAIEmbedding.getSupportedModels()['voyage-code-3.5']).toMatchObject({
+            dimension: '1024 (default), 256, 512, 2048',
+            contextLength: 32000,
+        });
+    });
+
+    it('embeds searches as queries and indexed chunks as documents', async () => {
+        mockEmbed.mockResolvedValue({ data: [{ index: 0, embedding: [0.1, 0.2] }] });
+        const embedding = new VoyageAIEmbedding({ apiKey: 'test-api-key', model: 'voyage-code-3.5' });
+
+        await embedding.embed('where do we split a batch on 429?', { mode: 'search' });
+        expect(mockEmbed).toHaveBeenLastCalledWith(expect.objectContaining({ inputType: 'query' }));
+
+        await embedding.embed('const value = 1;', { mode: 'full' });
+        expect(mockEmbed).toHaveBeenLastCalledWith(expect.objectContaining({ inputType: 'document' }));
+
+        await embedding.embedBatch(['const value = 1;']);
+        expect(mockEmbed).toHaveBeenLastCalledWith(expect.objectContaining({ inputType: 'document' }));
+    });
+
     it('parses the leading default dimension from variable-dimension model metadata', () => {
         const defaultDimensionModels = [
             'voyage-4-large',
             'voyage-4',
             'voyage-4-lite',
             'voyage-4-nano',
+            'voyage-code-3.5',
             'voyage-code-3',
         ];
 

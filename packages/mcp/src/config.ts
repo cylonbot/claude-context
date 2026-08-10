@@ -90,7 +90,7 @@ export function getDefaultModelForProvider(provider: string): string {
         case 'OpenAI':
             return 'text-embedding-3-small';
         case 'VoyageAI':
-            return 'voyage-code-3';
+            return 'voyage-code-3.5';
         case 'Gemini':
             return 'gemini-embedding-001';
         case 'OpenRouter':
@@ -300,10 +300,12 @@ Environment Variables:
   MILVUS_TOKEN            Milvus token (optional, used for authentication and address resolution)
   CODE_CHUNKS_COLLECTION_NAME_OVERRIDE
                           Optional readable prefix for collection names.
-                          Uses code_chunks_<override>_<pathHash> (or hybrid_...)
-                          after sanitization (letters/digits/underscore, 255 chars max).
-                          The per-codebase pathHash is preserved so multiple
-                          codebases stay distinct under the same override.
+                          Uses code_chunks_<override>_<pathHash>_<embeddingHash>
+                          (or hybrid_...) after sanitization (letters/digits/
+                          underscore, 255 chars max including both hashes).
+                          pathHash keeps multiple codebases distinct under the
+                          same override; embeddingHash keeps indexes built with
+                          different embedding providers/models apart.
 
   MCP Sync Configuration:
   CLAUDE_CONTEXT_BACKGROUND_SYNC
@@ -335,7 +337,7 @@ Examples:
   EMBEDDING_PROVIDER=VoyageAI VOYAGEAI_API_KEY=pa-xxx EMBEDDING_MODEL=voyage-3-large MILVUS_TOKEN=your-token npx @zilliz/claude-context-mcp@latest
 
   # Start MCP server with VoyageAI dual-key mode (free for search/incremental, paid for full indexing + fallback)
-  EMBEDDING_PROVIDER=VoyageAI VOYAGEAI_API_KEY=pa-paid VOYAGEAI_API_KEY_FREE=pa-free EMBEDDING_MODEL=voyage-code-3 MILVUS_TOKEN=your-token npx @zilliz/claude-context-mcp@latest
+  EMBEDDING_PROVIDER=VoyageAI VOYAGEAI_API_KEY=pa-paid VOYAGEAI_API_KEY_FREE=pa-free EMBEDDING_MODEL=voyage-code-3.5 MILVUS_TOKEN=your-token npx @zilliz/claude-context-mcp@latest
 
   # Start MCP server with Gemini and specific model
   EMBEDDING_PROVIDER=Gemini GEMINI_API_KEY=xxx EMBEDDING_MODEL=gemini-embedding-001 MILVUS_TOKEN=your-token npx @zilliz/claude-context-mcp@latest

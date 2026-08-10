@@ -133,6 +133,8 @@ describe('Context request-scoped splitters', () => {
         await fs.writeFile(filePath, 'first version');
 
         const vectorDatabase = createVectorDatabase();
+        // Incremental sync requires an existing index; without it reindexByChange bails out.
+        vectorDatabase.hasCollection.mockResolvedValue(true);
         const contextSplitter = new RecordingSplitter('context');
         const requestSplitter = new RecordingSplitter('request');
         const context = new Context({

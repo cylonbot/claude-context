@@ -152,7 +152,7 @@ Pasting the following configuration into your Cursor `~/.cursor/mcp.json` file i
       "env": {
         "EMBEDDING_PROVIDER": "VoyageAI",
         "VOYAGEAI_API_KEY": "your-voyageai-api-key",
-        "EMBEDDING_MODEL": "voyage-code-3",
+        "EMBEDDING_MODEL": "voyage-code-3.5",
         "MILVUS_TOKEN": "your-zilliz-cloud-api-key"
       }
     }

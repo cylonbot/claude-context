@@ -291,8 +291,27 @@ export class ToolHandlers {
             // Add cloud codebases that are missing from local snapshot (recovery).
             // Query Milvus for the real row count — if unknown/empty, skip the write
             // so we don't persist a poisoning 0/0+completed entry (Issue #295).
+            //
+            // A codebase that is still indexing is deliberately absent from the indexed list
+            // while its collection already exists and is filling up, so "in cloud but not in
+            // the snapshot" is its normal in-flight state, not a lost snapshot. Recovering it
+            // would overwrite the live progress entry with a partial row count marked
+            // 'completed' — and since this runs from index/search/status handlers, merely
+            // checking on a running index would corrupt its own status.
+            // Checked from three angles because none alone is complete: the running task map
+            // only knows about indexing this process started, and getIndexingCodebases() reads
+            // the snapshot file, which lags in-memory progress updates.
+            const indexingCodebases = new Set(this.snapshotManager.getIndexingCodebases());
+            const isIndexing = (codebasePath: string) =>
+                this.indexingTasks.has(codebasePath)
+                || indexingCodebases.has(codebasePath)
+                || this.snapshotManager.getCodebaseInfo(codebasePath)?.status === 'indexing';
             for (const cloudCodebase of cloudCodebases) {
                 if (!localCodebases.has(cloudCodebase)) {
+                    if (isIndexing(cloudCodebase)) {
+                        console.log(`[SYNC-CLOUD] ⏭️  Skipped recovery for ${cloudCodebase} (indexing in progress)`);
+                        continue;
+                    }
                     const stats = await this.queryCollectionStats(cloudCodebase);
                     if (stats) {
                         this.snapshotManager.setCodebaseIndexed(cloudCodebase, {
@@ -425,14 +444,16 @@ export class ToolHandlers {
                 };
             }
 
-            // If force reindex and codebase is already indexed, remove it
+            // If force reindex and codebase is already indexed, remove it.
+            // Cleared unconditionally, not behind hasIndex(): after an embedding-model change
+            // the current collection name points at nothing, yet the codebase's old collections
+            // are still sitting in the vector DB eating its collection quota — and clearIndex is
+            // what finds and drops them. It is a no-op when there is genuinely nothing to clear.
             if (forceReindex) {
                 this.snapshotManager.removeCodebaseCompletely(absolutePath);
                 this.snapshotManager.saveCodebaseSnapshot();
-                if (await this.context.hasIndex(absolutePath)) {
-                    console.log(`[FORCE-REINDEX] 🔄 Clearing index for '${absolutePath}'`);
-                    await this.context.clearIndex(absolutePath);
-                }
+                console.log(`[FORCE-REINDEX] 🔄 Clearing index for '${absolutePath}'`);
+                await this.context.clearIndex(absolutePath);
             }
 
             // CRITICAL: Pre-index collection creation validation

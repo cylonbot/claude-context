@@ -164,7 +164,10 @@ describe('Context ignore pattern isolation', () => {
         await fs.writeFile(path.join(project, 'custom.foo'), 'custom extension file');
         await fs.writeFile(path.join(project, 'ignored.ts'), 'ignored by request pattern');
 
-        const context = new Context({ vectorDatabase: createVectorDatabase() });
+        const vectorDatabase = createVectorDatabase();
+        // Incremental sync requires an existing index; without it reindexByChange bails out.
+        vectorDatabase.hasCollection.mockResolvedValue(true);
+        const context = new Context({ vectorDatabase });
 
         try {
             await context.reindexByChange(project, undefined, ['*.ts'], ['foo']);

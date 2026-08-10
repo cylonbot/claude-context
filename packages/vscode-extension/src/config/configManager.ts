@@ -70,7 +70,7 @@ const EMBEDDING_PROVIDERS = {
         ] as FieldDefinition[],
         optionalFields: [] as FieldDefinition[],
         defaultConfig: {
-            model: 'voyage-code-3'
+            model: 'voyage-code-3.5'
         }
     },
     'Ollama': {

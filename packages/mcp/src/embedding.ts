@@ -65,6 +65,10 @@ export function createEmbeddingInstance(config: ContextMcpConfig): OpenAIEmbeddi
                 apiKey: config.openrouterApiKey,
                 model: config.embeddingModel,
                 baseURL: 'https://openrouter.ai/api/v1',
+                // Without this the instance would report itself as OpenAI, and an index built
+                // through OpenRouter would share a collection with a real OpenAI index of the
+                // same model name.
+                provider: 'OpenRouter',
             });
             console.log(`[EMBEDDING] ✅ OpenRouter embedding instance created successfully`);
             return openrouterEmbedding;

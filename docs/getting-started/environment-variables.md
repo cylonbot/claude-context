@@ -28,7 +28,7 @@ Claude Context supports a global configuration file at `~/.context/.env` to simp
 | `GEMINI_API_KEY` | Gemini API key | Required for Gemini |
 | `GEMINI_BASE_URL` | Gemini API base URL (optional, for custom endpoints) | `https://generativelanguage.googleapis.com/v1beta` |
 
-> **💡 Note:** `EMBEDDING_MODEL` is a universal environment variable that works with all embedding providers. Simply set it to the model name you want to use (e.g., `text-embedding-3-large` for OpenAI, `voyage-code-3` for VoyageAI, etc.).
+> **💡 Note:** `EMBEDDING_MODEL` is a universal environment variable that works with all embedding providers. Simply set it to the model name you want to use (e.g., `text-embedding-3-large` for OpenAI, `voyage-code-3.5` for VoyageAI, etc.).
 
 > **Supported Model Names:**
 > 

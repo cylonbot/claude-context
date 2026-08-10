@@ -75,8 +75,8 @@ VoyageAI offers specialized code embeddings optimized for programming languages.
 # Required: Your VoyageAI API key (paid/commercial — used for full indexing and as search fallback)
 VOYAGEAI_API_KEY=pa-your-voyageai-api-key
 
-# Optional: Specify embedding model (default: voyage-code-3)
-EMBEDDING_MODEL=voyage-code-3
+# Optional: Specify embedding model (default: voyage-code-3.5)
+EMBEDDING_MODEL=voyage-code-3.5
 ```
 
 **Dual-key mode (free pool + paid):**
@@ -392,7 +392,7 @@ Pasting the following configuration into your Cursor `~/.cursor/mcp.json` file i
         "EMBEDDING_PROVIDER": "VoyageAI",
         "VOYAGEAI_API_KEY": "your-paid-voyageai-api-key",
         "VOYAGEAI_API_KEY_FREE": "your-free-voyageai-api-key",
-        "EMBEDDING_MODEL": "voyage-code-3",
+        "EMBEDDING_MODEL": "voyage-code-3.5",
         "MILVUS_TOKEN": "your-zilliz-cloud-api-key"
       }
     }

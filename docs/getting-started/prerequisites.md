@@ -14,7 +14,7 @@ Before setting up Claude Context, ensure you have the following requirements met
 
 #### Option 2: VoyageAI
 - **API Key**: Get from [VoyageAI Console](https://dash.voyageai.com/)
-- **Models**: `voyage-code-3` (optimized for code)
+- **Models**: `voyage-code-3.5` (optimized for code)
 - **Billing**: Pay-per-use pricing
 
 #### Option 3: Gemini
