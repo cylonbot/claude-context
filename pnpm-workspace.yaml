@@ -2,5 +2,31 @@ packages:
   - packages/*
   - examples/*
 
+allowBuilds:
+  # Нативные парсеры: везут готовые N-API prebuilds, сборка нужна только
+  # как fallback на платформах без prebuild.
+  tree-sitter: true
+  tree-sitter-c-sharp: true
+  tree-sitter-cpp: true
+  tree-sitter-go: true
+  tree-sitter-java: true
+  tree-sitter-javascript: true
+  tree-sitter-python: true
+  tree-sitter-rust: true
+  tree-sitter-scala: true
+  tree-sitter-typescript: true
+  # CLI грамматик: postinstall докачивает бинарь.
+  tree-sitter-cli: true
+  # Бинарники тулинга (tsx/webpack/eslint-resolver, gRPC-протоколы).
+  esbuild: true
+  protobufjs: true
+  unrs-resolver: true
+  # chmod +x на бинарь подписи — нужен для `pnpm release:vscode`.
+  '@vscode/vsce-sign': true
+  # Нативная сборка ради keychain в vsce; публикуемся через VSCE_PAT.
+  keytar: false
+  # В исходниках не используется — сборка ни к чему.
+  faiss-node: false
+
 ignoredBuiltDependencies:
   - faiss-node
