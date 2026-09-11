@@ -97,4 +97,17 @@ describe('SlidingWindowRateLimiter', () => {
         // It reserved the freed slot, so a further immediate acquire is blocked again.
         expect(limiter.wouldExceed(10)).toBe(true);
     });
+
+    it('waitForCapacity gives up as soon as the signal fires, reserving nothing', async () => {
+        const limiter = new SlidingWindowRateLimiter(1, 1_000_000, 60_000);
+        limiter.record(10); // RPM=1 already used → the next acquire would wait a full minute
+        const controller = new AbortController();
+        setTimeout(() => controller.abort(), 20);
+
+        const start = Date.now();
+        await expect(limiter.waitForCapacity(10, controller.signal)).rejects.toMatchObject({ name: 'AbortError' });
+
+        expect(Date.now() - start).toBeLessThan(5_000);
+        expect((limiter as any).records).toHaveLength(1);
+    });
 });

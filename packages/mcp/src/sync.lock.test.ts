@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -54,6 +55,12 @@ function ownerToken(lockPath: string): string | undefined {
     }
 }
 
+/** Put a lock owned by another process in place, taking over any existing one. */
+function writeForeignLock(lockPath: string, owner: { pid: number; codebase?: string }): void {
+    fs.mkdirSync(lockPath, { recursive: true });
+    fs.writeFileSync(path.join(lockPath, "owner.json"), JSON.stringify({ token: FOREIGN_TOKEN, ...owner }));
+}
+
 test("shutdown of a process that only saw the lock busy does not free it for others", () => {
     withTempHome(({ lockPath }) => {
         const holder = newManager();
@@ -85,7 +92,7 @@ test("does not remove a lock another process has taken over since", () => {
         const manager = newManager();
         assert.equal(acquire(manager), true);
 
-        fs.writeFileSync(path.join(lockPath, "owner.json"), JSON.stringify({ pid: 999999, token: FOREIGN_TOKEN }));
+        writeForeignLock(lockPath, { pid: 999999 });
         manager.releaseLockForShutdown();
 
         assert.equal(ownerToken(lockPath), FOREIGN_TOKEN);
@@ -103,6 +110,36 @@ test("heartbeat reports a lost lock once instead of going quiet", (t) => {
 
         const lostLines = fs.readFileSync(logPath, "utf8").split("\n").filter((line) => line.includes("lock LOST"));
         assert.equal(lostLines.length, 1);
+        manager.releaseLockForShutdown();
+    });
+});
+
+test("reports another live process syncing the same codebase", () => {
+    withTempHome(({ lockPath }) => {
+        writeForeignLock(lockPath, { pid: process.ppid, codebase: "/repo" });
+        const manager = newManager();
+
+        assert.equal(manager.getForeignCodebaseSync("/repo"), process.ppid);
+        assert.equal(manager.getForeignCodebaseSync("/other-repo"), null);
+    });
+});
+
+test("ignores a codebase announcement left behind by a dead process", () => {
+    withTempHome(({ lockPath }) => {
+        const deadPid = spawnSync(process.execPath, ["-e", ""]).pid;
+        writeForeignLock(lockPath, { pid: deadPid, codebase: "/repo" });
+
+        assert.equal(newManager().getForeignCodebaseSync("/repo"), null);
+    });
+});
+
+test("does not report its own sync as foreign", () => {
+    withTempHome(() => {
+        const manager = newManager();
+        assert.equal(acquire(manager), true);
+        (manager as any).announceSyncCodebase("/repo");
+
+        assert.equal(manager.getForeignCodebaseSync("/repo"), null);
         manager.releaseLockForShutdown();
     });
 });

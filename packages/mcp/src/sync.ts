@@ -1,7 +1,7 @@
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
-import { Context, FileSynchronizer, envManager } from "@zilliz/claude-context-core";
+import { Context, FileSynchronizer, IndexAbortError, envManager } from "@zilliz/claude-context-core";
 import { SnapshotManager } from "./snapshot.js";
 import type { RequestSplitterType } from "./config.js";
 import { createRequestSplitter, resolveRequestSplitterType } from "./splitter.js";
@@ -68,6 +68,8 @@ export class SyncManager {
     private isSyncing: boolean = false;
     private syncLockToken: string | null = null;
     private syncLockHeartbeat: NodeJS.Timeout | null = null;
+    /** The incremental run in flight right now, so index_codebase/clear_index can cancel it. */
+    private currentRun: { codebasePath: string; controller: AbortController; settled: Promise<void> } | null = null;
     private triggerWatcher: fs.FSWatcher | null = null;
     private triggerDebounceTimer: NodeJS.Timeout | null = null;
 
@@ -194,12 +196,72 @@ export class SyncManager {
     }
 
     /** The lock owner recorded on disk, or null when the lock or its owner file is absent/unreadable. */
-    private readSyncLockOwner(lockPath: string): { pid?: number; token?: string } | null {
+    private readSyncLockOwner(lockPath: string): { pid?: number; token?: string; codebase?: string } | null {
         try {
             return JSON.parse(fs.readFileSync(path.join(lockPath, "owner.json"), "utf8"));
         } catch {
             return null;
         }
+    }
+
+    /**
+     * Record in the lock which codebase this process is syncing right now (null: none), so an
+     * index_codebase/clear_index call in another process can tell that codebase is busy.
+     * Written via rename so a reader never sees a half-written owner file.
+     */
+    private announceSyncCodebase(codebasePath: string | null): void {
+        const lockPath = this.getSyncLockPath();
+        const owner = this.readSyncLockOwner(lockPath);
+        if (!owner || owner.token !== this.syncLockToken) {
+            return; // not (or no longer) ours to write into
+        }
+        try {
+            const tmpPath = path.join(lockPath, `owner.json.${process.pid}.tmp`);
+            fs.writeFileSync(tmpPath, JSON.stringify({ ...owner, codebase: codebasePath ?? undefined }, null, 2));
+            fs.renameSync(tmpPath, path.join(lockPath, "owner.json"));
+        } catch (error: any) {
+            console.warn(`[SYNC-DEBUG] Could not record the codebase being synced in the lock: ${error?.message || String(error)}`);
+        }
+    }
+
+    /**
+     * Abort this process's in-flight incremental run on `codebasePath`, if there is one, and wait
+     * until it has wound down; an aborted run writes and commits nothing further. Returns whether
+     * a run was cancelled.
+     */
+    public async cancelCodebaseSync(codebasePath: string): Promise<boolean> {
+        const run = this.currentRun;
+        if (!run || run.codebasePath !== codebasePath) {
+            return false;
+        }
+        syncLog(`reindexByChange CANCEL requested for '${path.basename(codebasePath)}'`);
+        run.controller.abort();
+        await run.settled;
+        return true;
+    }
+
+    /**
+     * Pid of another live MCP process whose sync is on `codebasePath` right now, or null. Read
+     * from the global sync lock, where the holder announces the codebase it is working on.
+     */
+    public getForeignCodebaseSync(codebasePath: string): number | null {
+        const lockPath = this.getSyncLockPath();
+        const owner = this.readSyncLockOwner(lockPath);
+        if (!owner?.pid || owner.codebase !== codebasePath || owner.pid === process.pid) {
+            return null;
+        }
+        // A holder that died without releasing leaves its announcement behind; it must not block.
+        try {
+            if (Date.now() - fs.statSync(lockPath).mtimeMs > this.getSyncLockStaleMs()) {
+                return null;
+            }
+            process.kill(owner.pid, 0);
+        } catch (error: any) {
+            if (error?.code !== "EPERM") { // EPERM: alive, just not ours to signal
+                return null;
+            }
+        }
+        return owner.pid;
     }
 
     private releaseGlobalSyncLock(): void {
@@ -296,6 +358,16 @@ export class SyncManager {
                 }
 
                 try {
+                    // The list above was read when the cycle started. Re-check that the codebase is
+                    // still indexed, so one that index_codebase/clear_index has since taken over is
+                    // skipped rather than synced into its fresh index. Announcing it in the lock first
+                    // lets such a call in another process see that we're on it and refuse.
+                    this.announceSyncCodebase(codebasePath);
+                    if (!this.snapshotManager.getIndexedCodebases().includes(codebasePath)) {
+                        syncLog(`reindexByChange SKIP '${path.basename(codebasePath)}' — no longer indexed (re-indexed or cleared meanwhile)`);
+                        continue;
+                    }
+
                     console.log(`[SYNC-DEBUG] Calling context.reindexByChange() for '${codebasePath}'`);
                     syncLog(`reindexByChange START '${path.basename(codebasePath)}'`);
                     const codebaseInfo = this.snapshotManager.getCodebaseInfo(codebasePath);
@@ -303,7 +375,8 @@ export class SyncManager {
                     const requestIgnorePatterns = codebaseInfo?.requestIgnorePatterns || [];
                     const requestCustomExtensions = codebaseInfo?.requestCustomExtensions || [];
                     let lastPhase = '';
-                    const stats = await this.context.reindexByChange(
+                    const controller = new AbortController();
+                    const run = this.context.reindexByChange(
                         codebasePath,
                         (progress) => {
                             // Log each distinct phase so a stuck/slow file is visible in the log.
@@ -314,8 +387,13 @@ export class SyncManager {
                         },
                         requestIgnorePatterns,
                         requestCustomExtensions,
-                        createRequestSplitter(requestSplitterType)
+                        createRequestSplitter(requestSplitterType),
+                        controller.signal
                     );
+                    this.currentRun = { codebasePath, controller, settled: run.then(() => undefined, () => undefined) };
+                    const stats = await run.finally(() => {
+                        this.currentRun = null;
+                    });
                     const codebaseElapsed = Date.now() - codebaseStartTime;
 
                     syncLog(`reindexByChange DONE '${path.basename(codebasePath)}' added=${stats.added} removed=${stats.removed} modified=${stats.modified} in ${codebaseElapsed}ms`);
@@ -334,6 +412,12 @@ export class SyncManager {
                     }
                 } catch (error: any) {
                     const codebaseElapsed = Date.now() - codebaseStartTime;
+                    if (error instanceof IndexAbortError) {
+                        // Cancelled on purpose: index_codebase/clear_index took this codebase over and
+                        // owns its collection and file snapshot now, so leave both alone.
+                        syncLog(`reindexByChange ABORTED '${path.basename(codebasePath)}' after ${codebaseElapsed}ms: ${error.message}`);
+                        continue;
+                    }
                     syncLog(`reindexByChange ERROR '${path.basename(codebasePath)}' after ${codebaseElapsed}ms: ${error?.message || error}`);
                     console.error(`[SYNC-DEBUG] Error syncing codebase '${codebasePath}' after ${codebaseElapsed}ms:`, error);
                     console.error(`[SYNC-DEBUG] Error stack:`, error.stack);
@@ -352,6 +436,8 @@ export class SyncManager {
                     }
 
                     // Continue with next codebase even if one fails
+                } finally {
+                    this.announceSyncCodebase(null);
                 }
             }
 

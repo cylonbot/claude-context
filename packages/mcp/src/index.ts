@@ -72,7 +72,7 @@ class ContextMcpServer {
         // Initialize managers
         this.snapshotManager = new SnapshotManager();
         this.syncManager = new SyncManager(this.context, this.snapshotManager);
-        this.toolHandlers = new ToolHandlers(this.context, this.snapshotManager);
+        this.toolHandlers = new ToolHandlers(this.context, this.snapshotManager, this.syncManager);
 
         // Load existing codebase snapshot on startup
         this.snapshotManager.loadCodebaseSnapshot();
@@ -90,6 +90,7 @@ Index a codebase directory to enable semantic search using a configurable code s
 ✨ **Usage Guidance**:
 - This tool is typically used when search fails due to an unindexed codebase.
 - If indexing is attempted on an already indexed path, and a conflict is detected, you MUST prompt the user to confirm whether to proceed with a force index (i.e., re-indexing and overwriting the previous index).
+- A force index fails while another MCP process (another session) is incrementally syncing the codebase; the error names its pid. Retry once that sync finishes.
 `;
 
 
@@ -193,7 +194,7 @@ This tool is versatile and can be used before completing various tasks to retrie
                     },
                     {
                         name: "clear_index",
-                        description: `Clear the search index. IMPORTANT: You MUST provide an absolute path.`,
+                        description: `Clear the search index. IMPORTANT: You MUST provide an absolute path. Fails while another MCP process (another session) is incrementally syncing this codebase; retry once that sync finishes.`,
                         inputSchema: {
                             type: "object",
                             properties: {

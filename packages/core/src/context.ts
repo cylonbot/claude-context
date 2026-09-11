@@ -496,7 +496,8 @@ export class Context {
         progressCallback?: (progress: { phase: string; current: number; total: number; percentage: number }) => void,
         additionalIgnorePatterns: string[] = [],
         additionalSupportedExtensions: string[] = [],
-        requestSplitter?: Splitter
+        requestSplitter?: Splitter,
+        signal?: AbortSignal
     ): Promise<{ added: number, removed: number, modified: number }> {
         const collectionName = this.getCollectionName(codebasePath);
 
@@ -557,14 +558,25 @@ export class Context {
             progressCallback?.({ phase, current: processedChanges, total: totalProgressSteps, percentage });
         };
 
+        // Cooperative cancellation (index_codebase force / clear_index taking this codebase
+        // over): stop before the next write and never commit, so whoever cancelled us owns
+        // the collection from here on and these changes stay pending for a later sync.
+        const throwIfAborted = () => {
+            if (signal?.aborted) {
+                throw new IndexAbortError(`Sync aborted after ${processedChanges}/${totalProgressSteps} steps`);
+            }
+        };
+
         // Handle removed files
         for (const file of removed) {
+            throwIfAborted();
             await this.deleteFileChunks(collectionName, file);
             updateProgress(`Removed ${file}`);
         }
 
         // Handle modified files
         for (const file of modified) {
+            throwIfAborted();
             await this.deleteFileChunks(collectionName, file);
             updateProgress(`Deleted old chunks for ${file}`);
         }
@@ -580,7 +592,7 @@ export class Context {
                     updateProgress(`Indexed ${filePath} (${fileIndex}/${totalFiles})`);
                 },
                 splitter,
-                undefined,
+                signal,
                 'incremental'
             );
         }
@@ -590,6 +602,7 @@ export class Context {
         // or the process was killed mid-sync), we never reach here, so the snapshot
         // stays at its previous state and these changes are re-detected and retried on
         // the next sync instead of being silently lost.
+        throwIfAborted();
         await currentSynchronizer.commitChanges();
 
         console.log(`[Context] ✅ Re-indexing complete. Added: ${added.length}, Removed: ${removed.length}, Modified: ${modified.length}`);
@@ -1010,10 +1023,10 @@ export class Context {
                     // Process batch when buffer reaches EMBEDDING_BATCH_SIZE
                     if (chunkBuffer.length >= EMBEDDING_BATCH_SIZE) {
                         try {
-                            await this.processChunkBuffer(chunkBuffer, indexMode);
+                            await this.processChunkBuffer(chunkBuffer, indexMode, signal);
                         } catch (error) {
-                            // Embedding errors (such as API having no quota) halt the entire indexing process and propagate upwards.
-                            if (error instanceof EmbeddingError) {
+                            // Embedding errors (such as API having no quota) and cancellation halt the entire indexing process and propagate upwards.
+                            if (error instanceof EmbeddingError || error instanceof IndexAbortError) {
                                 throw error;
                             }
                             const searchType = isHybrid === true ? 'hybrid' : 'regular';
@@ -1042,7 +1055,7 @@ export class Context {
                 }
 
             } catch (error) {
-                if (error instanceof EmbeddingError) {
+                if (error instanceof EmbeddingError || error instanceof IndexAbortError) {
                     throw error;
                 }
                 console.warn(`[Context] ⚠️  Skipping file ${filePath}: ${error}`);
@@ -1054,9 +1067,9 @@ export class Context {
             const searchType = isHybrid === true ? 'hybrid' : 'regular';
             console.log(`📝 Processing final batch of ${chunkBuffer.length} chunks for ${searchType}`);
             try {
-                await this.processChunkBuffer(chunkBuffer, indexMode);
+                await this.processChunkBuffer(chunkBuffer, indexMode, signal);
             } catch (error) {
-                if (error instanceof EmbeddingError) {
+                if (error instanceof EmbeddingError || error instanceof IndexAbortError) {
                     throw error;
                 }
                 console.error(`[Context] ❌ Failed to process final chunk batch for ${searchType}:`, error);
@@ -1082,7 +1095,8 @@ export class Context {
  */
     private async processChunkBuffer(
         chunkBuffer: Array<{ chunk: CodeChunk; codebasePath: string }>,
-        indexMode: 'full' | 'incremental' = 'full'
+        indexMode: 'full' | 'incremental' = 'full',
+        signal?: AbortSignal
     ): Promise<void> {
         if (chunkBuffer.length === 0) return;
 
@@ -1096,7 +1110,7 @@ export class Context {
         const isHybrid = this.getIsHybrid();
         const searchType = isHybrid === true ? 'hybrid' : 'regular';
         console.log(`[Context] 🔄 Processing batch of ${chunks.length} chunks (~${estimatedTokens} tokens) for ${searchType}`);
-        await this.processChunkBatch(chunks, codebasePath, indexMode);
+        await this.processChunkBatch(chunks, codebasePath, indexMode, signal);
     }
 
     /**
@@ -1105,7 +1119,8 @@ export class Context {
     private async processChunkBatch(
         chunks: CodeChunk[],
         codebasePath: string,
-        indexMode: 'full' | 'incremental' = 'full'
+        indexMode: 'full' | 'incremental' = 'full',
+        signal?: AbortSignal
     ): Promise<void> {
         const isHybrid = this.getIsHybrid();
 
@@ -1116,13 +1131,21 @@ export class Context {
 
         let embeddings: EmbeddingVector[];
         try {
-            embeddings = await this.embedding.embedBatch(chunkContents, { mode: indexMode });
+            embeddings = await this.embedding.embedBatch(chunkContents, { mode: indexMode, signal });
         } catch (error) {
+            if (signal?.aborted) {
+                throw new IndexAbortError(`Indexing aborted while embedding a batch of ${chunkContents.length} chunks`);
+            }
             const errorMessage = error instanceof Error ? error.message : String(error);
             // Include batch size in the log/error message so operators can
             // identify how many chunks were lost when the API call failed.
             console.error(`[Context] ❌ Embedding API failed (batch size: ${chunkContents.length}): ${errorMessage}`);
             throw new EmbeddingError(`Embedding API error (batch size: ${chunkContents.length}): ${errorMessage}`);
+        }
+        // Embedding on a paced free key can take minutes. If we were cancelled meanwhile, drop the
+        // batch rather than write it into a collection the canceller is about to drop or rebuild.
+        if (signal?.aborted) {
+            throw new IndexAbortError(`Indexing aborted before writing a batch of ${chunks.length} chunks`);
         }
         this.validateEmbeddings(embeddings, chunks.length);
 

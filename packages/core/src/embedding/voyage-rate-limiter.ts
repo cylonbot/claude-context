@@ -1,3 +1,5 @@
+import { setTimeout as delay } from 'timers/promises';
+
 /**
  * Token-aware sliding-window rate limiter for the VoyageAI free tier.
  *
@@ -137,19 +139,22 @@ export class SlidingWindowRateLimiter {
 
     /**
      * Block until a call costing `tokens` fits within the free-tier budget, then
-     * atomically reserve it. Resolves immediately if there is capacity now.
+     * atomically reserve it. Resolves immediately if there is capacity now. Rejects,
+     * reserving nothing, as soon as `signal` fires, so a cancelled caller isn't left
+     * waiting out a rate-limit window.
      */
-    async waitForCapacity(tokens: number): Promise<void> {
+    async waitForCapacity(tokens: number, signal?: AbortSignal): Promise<void> {
         // Loop because new records may be added by concurrent callers while we sleep.
         // eslint-disable-next-line no-constant-condition
         while (true) {
+            signal?.throwIfAborted();
             const now = Date.now();
             if (this.tryAcquire(tokens, now)) {
                 return;
             }
             const waitUntil = this.nextAvailableAt(tokens, now);
             const sleepMs = Math.max(50, waitUntil - now);
-            await new Promise(resolve => setTimeout(resolve, sleepMs));
+            await delay(sleepMs, undefined, { signal });
         }
     }
 }

@@ -57,6 +57,25 @@ describe('VoyageAIEmbedding', () => {
         expect(mockEmbed).toHaveBeenLastCalledWith(expect.objectContaining({ inputType: 'document' }));
     });
 
+    it('stops waiting for free-tier capacity once the signal fires', async () => {
+        mockEmbed.mockResolvedValue({ data: [{ index: 0, embedding: [0.1, 0.2] }] });
+        const embedding = new VoyageAIEmbedding({
+            apiKey: 'paid-key',
+            model: 'voyage-code-3.5',
+            freeApiKeys: ['free-key'],
+            freeRpm: 1,
+        });
+        // The one free request this minute is spent, so the next batch would wait ~60s for the window.
+        await embedding.embedBatch(['const a = 1;'], { mode: 'incremental' });
+        const controller = new AbortController();
+        setTimeout(() => controller.abort(), 20);
+
+        await expect(
+            embedding.embedBatch(['const b = 2;'], { mode: 'incremental', signal: controller.signal })
+        ).rejects.toMatchObject({ name: 'AbortError' });
+        expect(mockEmbed).toHaveBeenCalledTimes(1);
+    });
+
     it('parses the leading default dimension from variable-dimension model metadata', () => {
         const defaultDimensionModels = [
             'voyage-4-large',

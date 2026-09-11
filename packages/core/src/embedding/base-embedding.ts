@@ -17,6 +17,11 @@ export interface EmbeddingVector {
  */
 export interface EmbedOptions {
     mode?: 'search' | 'incremental' | 'full';
+    /**
+     * Cancels the call. Providers that pace requests (VoyageAI's free-key pool) stop waiting
+     * for rate-limit capacity and reject as soon as it fires; others may ignore it.
+     */
+    signal?: AbortSignal;
 }
 
 /**

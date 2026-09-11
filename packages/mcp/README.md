@@ -253,6 +253,8 @@ Notes:
 
 By default, the MCP server runs startup + periodic background sync for compatibility with existing installations. The global cross-process sync lock ensures only one local MCP process performs a sync cycle at a time.
 
+`index_codebase` (with `force`) and `clear_index` take a codebase over from background sync: they first stop this process's own in-flight incremental sync of that codebase, and fail with an error naming the other process's pid when another local MCP process is mid-sync on it. Retry once that sync finishes, or close that session.
+
 You can tune or disable periodic polling with environment variables:
 
 ```bash

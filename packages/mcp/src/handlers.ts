@@ -3,13 +3,19 @@ import * as path from "path";
 import * as crypto from "crypto";
 import { Context, COLLECTION_LIMIT_MESSAGE, FileSynchronizer, IndexAbortError } from "@zilliz/claude-context-core";
 import { SnapshotManager } from "./snapshot.js";
+import type { SyncManager } from "./sync.js";
 import type { CodebaseIndexOptions, RequestSplitterType } from "./config.js";
 import { createRequestSplitter, isRequestSplitterType } from "./splitter.js";
 import { ensureAbsolutePath, truncateContent, trackCodebasePath } from "./utils.js";
 
+type IncrementalSyncControl = Pick<SyncManager, "cancelCodebaseSync" | "getForeignCodebaseSync">;
+/** The result shape the tool handlers return to the MCP client. */
+type ToolResponse = { content: { type: string; text: string }[]; isError?: boolean };
+
 export class ToolHandlers {
     private context: Context;
     private snapshotManager: SnapshotManager;
+    private syncManager?: IncrementalSyncControl;
     private indexingStats: { indexedFiles: number; totalChunks: number } | null = null;
     private currentWorkspace: string;
     /**
@@ -21,11 +27,41 @@ export class ToolHandlers {
      */
     private indexingTasks: Map<string, { controller: AbortController; promise: Promise<void> }> = new Map();
 
-    constructor(context: Context, snapshotManager: SnapshotManager) {
+    constructor(context: Context, snapshotManager: SnapshotManager, syncManager?: IncrementalSyncControl) {
         this.context = context;
         this.snapshotManager = snapshotManager;
+        this.syncManager = syncManager;
         this.currentWorkspace = process.cwd();
         console.log(`[WORKSPACE] Current workspace: ${this.currentWorkspace}`);
+    }
+
+    /**
+     * Make sure no incremental sync is writing into this codebase before its index is dropped
+     * or rebuilt: stop this session's own in-flight run (waiting until it has wound down), and
+     * refuse while another MCP process is in the middle of one, since that run would keep
+     * inserting into the fresh collection. Returns the error response to send when the
+     * codebase is busy elsewhere, else null. Typed as a ToolResponse so callers returning it
+     * next to their own results keep one uniform result type.
+     */
+    private async takeOverFromIncrementalSync(absolutePath: string): Promise<ToolResponse | null> {
+        if (!this.syncManager) {
+            return null;
+        }
+        if (await this.syncManager.cancelCodebaseSync(absolutePath)) {
+            console.log(`[SYNC] Stopped the in-flight incremental sync of '${absolutePath}'`);
+        }
+        const pid = this.syncManager.getForeignCodebaseSync(absolutePath);
+        if (pid === null) {
+            return null;
+        }
+        return {
+            content: [{
+                type: "text",
+                text: `Codebase '${absolutePath}' is being incrementally synced by another claude-context MCP process ` +
+                    `(pid ${pid}, e.g. another Claude Code session). Try again once that sync finishes, or close that session.`
+            }],
+            isError: true
+        };
     }
 
     /**
@@ -442,6 +478,14 @@ export class ToolHandlers {
                     }],
                     isError: true
                 };
+            }
+
+            // An incremental sync still running on this codebase would keep writing into the index
+            // we are about to (re)build. For a force re-index the codebase is un-marked right below,
+            // with no await in between, so a sync cycle that hasn't reached it yet will skip it.
+            const busy = await this.takeOverFromIncrementalSync(absolutePath);
+            if (busy) {
+                return busy;
             }
 
             // If force reindex and codebase is already indexed, remove it.
@@ -926,6 +970,13 @@ export class ToolHandlers {
             }
 
             console.log(`[CLEAR] Clearing codebase: ${absolutePath}`);
+
+            // Stop an incremental sync of this codebase first (or refuse while another session
+            // runs one): it would otherwise keep writing into the collection we are about to drop.
+            const busy = await this.takeOverFromIncrementalSync(absolutePath);
+            if (busy) {
+                return busy;
+            }
 
             // Cancel any in-flight background indexing for this codebase and
             // wait for it to wind down before we drop the collection.

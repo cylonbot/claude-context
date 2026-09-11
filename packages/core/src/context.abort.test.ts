@@ -4,10 +4,15 @@ import * as path from 'path';
 import { Context, IndexAbortError } from './context';
 import { Embedding, EmbeddingVector } from './embedding';
 import { Splitter, CodeChunk } from './splitter';
+import { FileSynchronizer } from './sync/synchronizer';
 import { VectorDatabase } from './vectordb';
 
 class TestEmbedding extends Embedding {
     protected maxTokens = 8192;
+
+    constructor(private readonly onEmbedBatch?: () => void) {
+        super();
+    }
 
     async detectDimension(): Promise<number> {
         return 3;
@@ -18,6 +23,7 @@ class TestEmbedding extends Embedding {
     }
 
     async embedBatch(texts: string[]): Promise<EmbeddingVector[]> {
+        this.onEmbedBatch?.();
         return texts.map(() => ({ vector: [1, 0, 0], dimension: 3 }));
     }
 
@@ -70,35 +76,36 @@ const createVectorDatabase = (): jest.Mocked<VectorDatabase> => ({
     getCollectionRowCount: jest.fn().mockResolvedValue(0),
 });
 
+// Every test gets a throwaway HOME (file snapshots live under ~/.context) and non-hybrid mode.
+let tempRoot: string;
+let originalHome: string | undefined;
+let originalHybridMode: string | undefined;
+
+beforeEach(async () => {
+    tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-context-abort-'));
+    const homeDir = path.join(tempRoot, 'home');
+    await fs.mkdir(homeDir, { recursive: true });
+    originalHome = process.env.HOME;
+    originalHybridMode = process.env.HYBRID_MODE;
+    process.env.HOME = homeDir;
+    process.env.HYBRID_MODE = 'false';
+});
+
+afterEach(async () => {
+    if (originalHome === undefined) {
+        delete process.env.HOME;
+    } else {
+        process.env.HOME = originalHome;
+    }
+    if (originalHybridMode === undefined) {
+        delete process.env.HYBRID_MODE;
+    } else {
+        process.env.HYBRID_MODE = originalHybridMode;
+    }
+    await fs.rm(tempRoot, { recursive: true, force: true });
+});
+
 describe('Context indexCodebase AbortSignal support', () => {
-    let tempRoot: string;
-    let originalHome: string | undefined;
-    let originalHybridMode: string | undefined;
-
-    beforeEach(async () => {
-        tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-context-abort-'));
-        const homeDir = path.join(tempRoot, 'home');
-        await fs.mkdir(homeDir, { recursive: true });
-        originalHome = process.env.HOME;
-        originalHybridMode = process.env.HYBRID_MODE;
-        process.env.HOME = homeDir;
-        process.env.HYBRID_MODE = 'false';
-    });
-
-    afterEach(async () => {
-        if (originalHome === undefined) {
-            delete process.env.HOME;
-        } else {
-            process.env.HOME = originalHome;
-        }
-        if (originalHybridMode === undefined) {
-            delete process.env.HYBRID_MODE;
-        } else {
-            process.env.HYBRID_MODE = originalHybridMode;
-        }
-        await fs.rm(tempRoot, { recursive: true, force: true });
-    });
-
     it('completes normally when no signal is provided (regression guard)', async () => {
         const project = path.join(tempRoot, 'project');
         await fs.mkdir(project);
@@ -202,6 +209,58 @@ describe('Context indexCodebase AbortSignal support', () => {
         ).rejects.toBeInstanceOf(IndexAbortError);
 
         expect(splitter.calls).toBe(0);
+        expect(vectorDatabase.insert).not.toHaveBeenCalled();
+    });
+});
+
+describe('Context reindexByChange AbortSignal support', () => {
+    /** An indexed project with two changes pending since its file snapshot: one edited file, one new. */
+    const setUpChangedProject = async (embedding: Embedding) => {
+        const project = path.join(tempRoot, 'project');
+        await fs.mkdir(project);
+        await fs.writeFile(path.join(project, 'kept.ts'), 'const kept = 1;');
+
+        const vectorDatabase = createVectorDatabase();
+        // Incremental sync requires an existing index; without it reindexByChange bails out.
+        vectorDatabase.hasCollection.mockResolvedValue(true);
+        const context = new Context({ embedding, vectorDatabase, codeSplitter: new CountingSplitter() });
+        const synchronizer = new FileSynchronizer(
+            project,
+            await context.getEffectiveIgnorePatterns(project),
+            context.getEffectiveSupportedExtensions()
+        );
+        await synchronizer.initialize();
+        context.setSynchronizer(context.getCollectionName(project), synchronizer);
+
+        await fs.writeFile(path.join(project, 'kept.ts'), 'const kept = 2;');
+        await fs.writeFile(path.join(project, 'added.ts'), 'const added = 1;');
+        return { project, vectorDatabase, context };
+    };
+
+    it('throws IndexAbortError without writing or committing when aborted up front', async () => {
+        const { project, vectorDatabase, context } = await setUpChangedProject(new TestEmbedding());
+        const controller = new AbortController();
+        controller.abort();
+
+        await expect(
+            context.reindexByChange(project, undefined, [], [], undefined, controller.signal)
+        ).rejects.toBeInstanceOf(IndexAbortError);
+
+        expect(vectorDatabase.query).not.toHaveBeenCalled(); // no old chunks looked up for deletion
+        expect(vectorDatabase.insert).not.toHaveBeenCalled();
+        // Nothing was committed, so the next sync still sees both changes.
+        await expect(context.reindexByChange(project)).resolves.toEqual({ added: 1, removed: 0, modified: 1 });
+    });
+
+    it('drops a batch whose embedding finished after the signal fired', async () => {
+        const controller = new AbortController();
+        // Cancelled while the embedding call is in flight, e.g. waiting on a paced free key.
+        const { project, vectorDatabase, context } = await setUpChangedProject(new TestEmbedding(() => controller.abort()));
+
+        await expect(
+            context.reindexByChange(project, undefined, [], [], undefined, controller.signal)
+        ).rejects.toBeInstanceOf(IndexAbortError);
+
         expect(vectorDatabase.insert).not.toHaveBeenCalled();
     });
 });

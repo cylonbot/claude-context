@@ -142,14 +142,16 @@ export class VoyageAIEmbedding extends Embedding {
      *    so we never get stuck retrying a request that is fundamentally too big,
      *  - a lone chunk that still 429s is pure window contention: wait out the window and
      *    retry patiently (background work, no hard "give up" — only a high runaway guard),
-     *  - non-429 errors fail fast (don't loop on a genuinely broken chunk).
+     *  - non-429 errors fail fast (don't loop on a genuinely broken chunk),
+     *  - `signal` cancels it: the pacing wait rejects as soon as it fires (a request already
+     *    on the wire still completes), so a cancelled sync isn't stuck for minutes.
      * Never falls back to paid (incremental is free-only by design).
      */
-    private async embedFreeResilient(texts: string[], poolIndex: number, singleChunkAttempt: number = 0): Promise<EmbeddingVector[]> {
+    private async embedFreeResilient(texts: string[], poolIndex: number, signal?: AbortSignal, singleChunkAttempt: number = 0): Promise<EmbeddingVector[]> {
         const pool = this.freePool[poolIndex];
         const tokens = texts.reduce((sum, t) => sum + this.estimateTokens(t), 0);
         // waitForCapacity atomically reserves the slot before we await the network call.
-        await pool.limiter.waitForCapacity(tokens);
+        await pool.limiter.waitForCapacity(tokens, signal);
         try {
             const res = await this.callEmbedRaw(pool.client, texts);
             this.logger?.(`embed(free#${poolIndex}): ${texts.length} chunk(s), ~${tokens} est-tokens — ok`);
@@ -162,15 +164,15 @@ export class VoyageAIEmbedding extends Embedding {
             if (texts.length > 1) {
                 const mid = Math.floor(texts.length / 2);
                 this.logger?.(`embed(free#${poolIndex}): 429 on ${texts.length} chunks (~${tokens} tok) → splitting ${mid}+${texts.length - mid}`);
-                const left = await this.embedFreeResilient(texts.slice(0, mid), poolIndex);
-                const right = await this.embedFreeResilient(texts.slice(mid), poolIndex);
+                const left = await this.embedFreeResilient(texts.slice(0, mid), poolIndex, signal);
+                const right = await this.embedFreeResilient(texts.slice(mid), poolIndex, signal);
                 return [...left, ...right];
             }
             if (singleChunkAttempt >= this.incrementalMaxRetries) {
                 throw new Error(`Free tier still rate-limiting a single chunk after ${this.incrementalMaxRetries} window-waits: ${(err as any)?.message || err}`);
             }
             this.logger?.(`embed(free#${poolIndex}): 429 on a single chunk — waiting for window, retry ${singleChunkAttempt + 1}/${this.incrementalMaxRetries}`);
-            return this.embedFreeResilient(texts, poolIndex, singleChunkAttempt + 1);
+            return this.embedFreeResilient(texts, poolIndex, signal, singleChunkAttempt + 1);
         }
     }
 
@@ -242,7 +244,7 @@ export class VoyageAIEmbedding extends Embedding {
         // Incremental → free only, paced + resilient (never paid). Round-robin across the pool.
         if (mode === 'incremental') {
             const idx = (this.rrCounter++) % this.freePool.length;
-            return (await this.embedFreeResilient([processedText], idx))[0];
+            return (await this.embedFreeResilient([processedText], idx, options?.signal))[0];
         }
 
         // Search (default): use the first free key that still has per-minute budget; only when
@@ -288,10 +290,11 @@ export class VoyageAIEmbedding extends Embedding {
             const worker = async (poolIndex: number) => {
                 // eslint-disable-next-line no-constant-condition
                 while (true) {
+                    options?.signal?.throwIfAborted();
                     const i = cursor++;
                     if (i >= subBatches.length) return;
                     this.logger?.(`embed(free#${poolIndex}): sub-batch ${i + 1}/${subBatches.length} (${subBatches[i].length} chunks)...`);
-                    results[i] = await this.embedFreeResilient(subBatches[i], poolIndex);
+                    results[i] = await this.embedFreeResilient(subBatches[i], poolIndex, options?.signal);
                 }
             };
             await Promise.all(this.freePool.map((_, k) => worker(k)));
