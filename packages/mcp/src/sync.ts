@@ -163,20 +163,21 @@ export class SyncManager {
         this.stopSyncLockHeartbeat();
         const intervalMs = Math.max(SYNC_LOCK_HEARTBEAT_MIN_MS, Math.floor(staleMs / SYNC_LOCK_HEARTBEAT_DIVISOR));
         const heartbeat = setInterval(() => {
+            const owner = this.readSyncLockOwner(lockPath);
+            if (owner?.token !== this.syncLockToken) {
+                // Lost ownership: the lock was removed or reclaimed by another process. This sync
+                // keeps running unlocked, so another process may now be syncing alongside it —
+                // make that visible instead of silently going quiet.
+                syncLog(`lock LOST (${owner ? `now held by pid ${owner.pid}` : "lock removed"}) — this sync continues without it`);
+                this.stopSyncLockHeartbeat();
+                return;
+            }
             try {
-                const ownerPath = path.join(lockPath, "owner.json");
-                const owner = JSON.parse(fs.readFileSync(ownerPath, "utf8"));
-                if (owner.token !== this.syncLockToken) {
-                    // Lost ownership (another process reclaimed it) — stop refreshing.
-                    this.stopSyncLockHeartbeat();
-                    return;
-                }
                 const now = new Date();
                 fs.utimesSync(lockPath, now, now);
                 syncLog(`lock heartbeat (still syncing)`);
             } catch {
-                // Lock vanished or unreadable; nothing to refresh.
-                this.stopSyncLockHeartbeat();
+                // Lock vanished between the read and the touch; the next tick reports the loss.
             }
         }, intervalMs);
         if (typeof heartbeat.unref === "function") {
@@ -192,20 +193,36 @@ export class SyncManager {
         }
     }
 
+    /** The lock owner recorded on disk, or null when the lock or its owner file is absent/unreadable. */
+    private readSyncLockOwner(lockPath: string): { pid?: number; token?: string } | null {
+        try {
+            return JSON.parse(fs.readFileSync(path.join(lockPath, "owner.json"), "utf8"));
+        } catch {
+            return null;
+        }
+    }
+
     private releaseGlobalSyncLock(): void {
         this.stopSyncLockHeartbeat();
+        const token = this.syncLockToken;
+        this.syncLockToken = null;
+        // Remove the lock only when it provably is ours. A process that never held it (e.g. one that
+        // only ever saw "lock BUSY" and is now shutting down) must not touch it: deleting another
+        // process's lock lets a third process start a second, concurrent sync next to the real owner.
+        // A missing owner.json is no proof either — it may be another process's lock caught between
+        // its mkdir and writing the owner file.
+        if (!token) {
+            return;
+        }
         const lockPath = this.getSyncLockPath();
+        const owner = this.readSyncLockOwner(lockPath);
+        if (owner?.token !== token) {
+            console.warn(`[SYNC-DEBUG] Global sync lock is no longer ours. Skipping release: ${lockPath}`);
+            syncLog(`lock NOT RELEASED — ${owner ? `now held by pid ${owner.pid}` : "already removed"}`);
+            return;
+        }
         try {
-            const ownerPath = path.join(lockPath, "owner.json");
-            if (this.syncLockToken && fs.existsSync(ownerPath)) {
-                const owner = JSON.parse(fs.readFileSync(ownerPath, "utf8"));
-                if (owner.token && owner.token !== this.syncLockToken) {
-                    console.warn(`[SYNC-DEBUG] Global sync lock is owned by another process. Skipping release: ${lockPath}`);
-                    return;
-                }
-            }
             fs.rmSync(lockPath, { recursive: true, force: true });
-            this.syncLockToken = null;
             console.log(`[SYNC-DEBUG] Released global sync lock: ${lockPath}`);
             syncLog(`lock RELEASED`);
         } catch (error: any) {
