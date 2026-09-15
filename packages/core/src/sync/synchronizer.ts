@@ -15,6 +15,11 @@ export class FileSynchronizer {
     // confirms a successful index via commitChanges(). See checkForChanges().
     private pendingFileHashes: Map<string, string> | null = null;
     private pendingMerkleDAG: MerkleDAG | null = null;
+    // Identity (mtime + size) of the on-disk snapshot as of the last time THIS instance
+    // read or wrote it. The snapshot file is shared by every process that syncs the same
+    // codebase, so before diffing we check whether someone else has moved it on.
+    // See reloadSnapshotIfChangedOnDisk().
+    private loadedSnapshotStamp: { mtimeMs: number; size: number } | null = null;
 
     constructor(rootDir: string, ignorePatterns: string[] = [], supportedExtensions: string[] = []) {
         this.rootDir = rootDir;
@@ -238,6 +243,8 @@ export class FileSynchronizer {
     public async checkForChanges(): Promise<{ added: string[], removed: string[], modified: string[] }> {
         console.log('[Synchronizer] Checking for file changes...');
 
+        await this.reloadSnapshotIfChangedOnDisk();
+
         const newFileHashes = await this.generateFileHashes(this.rootDir);
         const newMerkleDAG = this.buildMerkleDAG(newFileHashes);
 
@@ -328,23 +335,72 @@ export class FileSynchronizer {
             merkleDAG: this.merkleDAG.serialize()
         });
         await fs.writeFile(this.snapshotPath, data, 'utf-8');
+        this.loadedSnapshotStamp = await this.statSnapshot();
         console.log(`Saved snapshot to ${this.snapshotPath}`);
+    }
+
+    private async statSnapshot(): Promise<{ mtimeMs: number; size: number } | null> {
+        try {
+            const stat = await fs.stat(this.snapshotPath);
+            return { mtimeMs: stat.mtimeMs, size: stat.size };
+        } catch (error: any) {
+            if (error.code === 'ENOENT') {
+                return null;
+            }
+            throw error;
+        }
+    }
+
+    private applySerializedSnapshot(data: string): void {
+        const obj = JSON.parse(data);
+
+        // Reconstruct Map without using constructor with iterator
+        this.fileHashes = new Map();
+        for (const [key, value] of obj.fileHashes) {
+            this.fileHashes.set(key, value);
+        }
+
+        if (obj.merkleDAG) {
+            this.merkleDAG = MerkleDAG.deserialize(obj.merkleDAG);
+        }
+    }
+
+    /**
+     * The snapshot file is shared by every process syncing this codebase (one MCP server
+     * per Claude session, serialized by the sync lock). Only the process that actually
+     * indexed a change writes the new snapshot; without this, every OTHER process keeps
+     * diffing against its own stale in-memory copy and re-indexes the same change on its
+     * next turn — N processes, N embeddings of every edit. So before diffing, pick up
+     * whatever the last committer wrote. A missing file keeps the in-memory state: that
+     * is still the best baseline we have, and regenerating it here would silently drop
+     * real changes.
+     */
+    private async reloadSnapshotIfChangedOnDisk(): Promise<void> {
+        // stat BEFORE read: if the file changes in between we record an older stamp
+        // and simply reload again next time, instead of missing an update.
+        const stamp = await this.statSnapshot();
+        if (!stamp) {
+            return;
+        }
+        if (this.loadedSnapshotStamp
+            && this.loadedSnapshotStamp.mtimeMs === stamp.mtimeMs
+            && this.loadedSnapshotStamp.size === stamp.size) {
+            return;
+        }
+
+        const data = await fs.readFile(this.snapshotPath, 'utf-8');
+        this.applySerializedSnapshot(data);
+        this.merkleDAG = this.buildMerkleDAG(this.fileHashes);
+        this.loadedSnapshotStamp = stamp;
+        console.log(`[Synchronizer] Snapshot on disk changed since this process last read it (another process synced?). Reloaded ${this.fileHashes.size} file hashes.`);
     }
 
     private async loadSnapshot(): Promise<void> {
         try {
+            const stamp = await this.statSnapshot();
             const data = await fs.readFile(this.snapshotPath, 'utf-8');
-            const obj = JSON.parse(data);
-
-            // Reconstruct Map without using constructor with iterator
-            this.fileHashes = new Map();
-            for (const [key, value] of obj.fileHashes) {
-                this.fileHashes.set(key, value);
-            }
-
-            if (obj.merkleDAG) {
-                this.merkleDAG = MerkleDAG.deserialize(obj.merkleDAG);
-            }
+            this.applySerializedSnapshot(data);
+            this.loadedSnapshotStamp = stamp;
             console.log(`Loaded snapshot from ${this.snapshotPath}`);
         } catch (error: any) {
             if (error.code === 'ENOENT') {
