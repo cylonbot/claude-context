@@ -10,7 +10,81 @@ import { ensureAbsolutePath, truncateContent, trackCodebasePath } from "./utils.
 
 type IncrementalSyncControl = Pick<SyncManager, "cancelCodebaseSync" | "getForeignCodebaseSync">;
 /** The result shape the tool handlers return to the MCP client. */
-type ToolResponse = { content: { type: string; text: string }[]; isError?: boolean };
+type ToolResponse = {
+    content: { type: string; text: string }[];
+    isError?: boolean;
+    /**
+     * Machine-readable twin of content (MCP structured tool output, supported by
+     * @modelcontextprotocol/sdk >= 1.10). Clients that understand it can filter or
+     * sort results without parsing the markdown rendering; clients that do not keep
+     * reading content unchanged.
+     */
+    structuredContent?: Record<string, unknown>;
+};
+
+/**
+ * Validate includePaths / excludePaths: repo-relative path prefixes matched against
+ * the stored relativePath ("src/" matches "src/a.ts"). Deliberately strict - an
+ * absolute path, a '..' segment, a '%' (a Milvus LIKE wildcard) or a double quote
+ * cannot be a plain prefix of a repo-relative path, and accepting one silently
+ * would turn a typo into an unfiltered search.
+ *
+ * Input separators are normalized; existing indexes may store either separator.
+ */
+function normalizePathPrefixes(value: unknown): { prefixes: string[]; invalid: unknown[] } {
+    const prefixes: string[] = [];
+    const invalid: unknown[] = [];
+    if (value === undefined || value === null) return { prefixes, invalid };
+    if (!Array.isArray(value)) return { prefixes, invalid: [value] };
+    for (const entry of value) {
+        if (typeof entry !== 'string') { invalid.push(entry); continue; }
+        const cleaned = entry.trim().replace(/\\/g, '/');
+        if (cleaned === ''
+            || cleaned.startsWith('/')
+            || cleaned.includes('"')
+            || cleaned.includes('%')
+            || cleaned.split('/').includes('..')) {
+            invalid.push(entry);
+            continue;
+        }
+        prefixes.push(cleaned);
+    }
+    return { prefixes, invalid };
+}
+
+/** Exact prefix test, re-applied to every hit after the vector search. */
+function matchesPathPrefix(relativePath: string, prefixes: string[]): boolean {
+    const normalizedPath = relativePath.replace(/\\/g, '/');
+    return prefixes.some((prefix) => normalizedPath.startsWith(prefix));
+}
+
+/** Match existing POSIX and Windows indexes without requiring re-indexing. */
+function buildPathPrefixClause(prefixes: string[]): string {
+    const storedPrefixes = new Set(prefixes.flatMap((prefix) => [prefix, prefix.replace(/\//g, '\\')]));
+    const clauses = Array.from(storedPrefixes, (prefix) => {
+        // A prefix is the lexical range [prefix, successor). String comparisons
+        // avoid version-dependent LIKE escaping of '_' and Windows separators.
+        const upperBound = pathPrefixUpperBound(prefix);
+        const lowerClause = 'relativePath >= ' + JSON.stringify(prefix);
+        return upperBound === undefined ? '(' + lowerClause + ')'
+            : '(' + lowerClause + ' and relativePath < ' + JSON.stringify(upperBound) + ')';
+    });
+    return '(' + clauses.join(' or ') + ')';
+}
+
+/** Successor in Unicode/UTF-8 lexical order, including supplementary characters. */
+function pathPrefixUpperBound(prefix: string): string | undefined {
+    const characters = Array.from(prefix);
+    while (characters.length > 0) {
+        const codePoint = characters.pop()!.codePointAt(0)!;
+        if (codePoint < 0x10ffff) {
+            const next = codePoint + 1;
+            return characters.join('') + String.fromCodePoint(next >= 0xd800 && next <= 0xdfff ? 0xe000 : next);
+        }
+    }
+    // A prefix made entirely of the highest code point has no finite successor.
+    return undefined;
+}
 
 export class ToolHandlers {
     private context: Context;
@@ -710,7 +784,7 @@ export class ToolHandlers {
     }
 
     public async handleSearchCode(args: any) {
-        const { path: codebasePath, query, limit = 10, extensionFilter } = args;
+        const { path: codebasePath, query, limit = 10, extensionFilter, includePaths, excludePaths } = args;
         const resultLimit = limit || 10;
 
         try {
@@ -805,6 +879,18 @@ export class ToolHandlers {
             console.log(`[SEARCH] 🧠 Using embedding provider: ${embeddingProvider.getProvider()} for search`);
             console.log(`[SEARCH] 🔍 Generating embeddings for query using ${embeddingProvider.getProvider()}...`);
 
+            // Path prefixes are validated before anything is searched: a rejected
+            // entry must fail the call, not silently widen the result set.
+            const include = normalizePathPrefixes(includePaths);
+            const exclude = normalizePathPrefixes(excludePaths);
+            const invalidPathPrefixes = [...include.invalid, ...exclude.invalid];
+            if (invalidPathPrefixes.length > 0) {
+                return {
+                    content: [{ type: 'text', text: 'Error: Invalid path prefixes in includePaths/excludePaths: ' + JSON.stringify(invalidPathPrefixes) + ". Use repo-relative prefixes like 'src/' or 'test/' - no leading '/', no '..', no '%'." }],
+                    isError: true
+                };
+            }
+
             // Build filter expression from extensionFilter list
             let filterExpr: string | undefined = undefined;
             if (Array.isArray(extensionFilter) && extensionFilter.length > 0) {
@@ -823,14 +909,48 @@ export class ToolHandlers {
                 filterExpr = `fileExtension in [${quoted}]`;
             }
 
+            // Apply both path filters before ranking so excluded rows cannot consume
+            // the candidate limit. Negate the exact prefix ranges for exclusions.
+            if (include.prefixes.length > 0) {
+                const includeClause = buildPathPrefixClause(include.prefixes);
+                filterExpr = filterExpr === undefined ? includeClause : filterExpr + ' and ' + includeClause;
+            }
+            if (exclude.prefixes.length > 0) {
+                const excludeClause = 'not ' + buildPathPrefixClause(exclude.prefixes);
+                filterExpr = filterExpr === undefined ? excludeClause : filterExpr + ' and ' + excludeClause;
+            }
+
+            const pathFiltered = include.prefixes.length > 0 || exclude.prefixes.length > 0;
+            const finalLimit = Math.min(resultLimit, 50);
+
             // Search in the specified codebase
-            const searchResults = await this.context.semanticSearch(
+            const rawResults = await this.context.semanticSearch(
                 searchCodebasePath,
                 query,
-                Math.min(resultLimit, 50),
+                finalLimit,
                 0.3,
                 filterExpr
             );
+
+            // Keep an exact check on returned hits, accepting either stored separator.
+            const searchResults = (pathFiltered
+                ? rawResults.filter((result: any) => {
+                    const relativePath = String(result.relativePath ?? '');
+                    if (include.prefixes.length > 0 && !matchesPathPrefix(relativePath, include.prefixes)) return false;
+                    if (exclude.prefixes.length > 0 && matchesPathPrefix(relativePath, exclude.prefixes)) return false;
+                    return true;
+                })
+                : rawResults).slice(0, finalLimit);
+
+            // Machine-readable twin of the markdown rendering below.
+            const structuredResults = searchResults.map((result: any) => ({
+                path: result.relativePath,
+                startLine: result.startLine,
+                endLine: result.endLine,
+                language: result.language,
+                score: result.score,
+                content: truncateContent(result.content, 5000)
+            }));
 
             console.log(`[SEARCH] ✅ Search completed! Found ${searchResults.length} results using ${embeddingProvider.getProvider()} embeddings`);
 
@@ -858,7 +978,14 @@ export class ToolHandlers {
                     content: [{
                         type: "text",
                         text: noResultsMessage
-                    }]
+                    }],
+                    structuredContent: {
+                        query,
+                        codebase: searchCodebasePath,
+                        requestedPath: absolutePath,
+                        count: 0,
+                        results: []
+                    }
                 };
             }
 
@@ -888,7 +1015,14 @@ export class ToolHandlers {
                 content: [{
                     type: "text",
                     text: resultMessage
-                }]
+                }],
+                structuredContent: {
+                    query,
+                    codebase: searchCodebasePath,
+                    requestedPath: absolutePath,
+                    count: searchResults.length,
+                    results: structuredResults
+                }
             };
         } catch (error) {
             // Check if this is the collection limit error

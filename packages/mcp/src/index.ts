@@ -187,6 +187,22 @@ This tool is versatile and can be used before completing various tasks to retrie
                                     },
                                     description: "Optional: List of file extensions to filter results. (e.g., ['.ts','.py']).",
                                     default: []
+                                },
+                                includePaths: {
+                                    type: "array",
+                                    items: {
+                                        type: "string"
+                                    },
+                                    description: "Optional: keep only results whose repo-relative path starts with one of these prefixes (e.g. ['src/', 'packages/core/']). Keep the trailing slash to avoid sibling matches ('src' would also match 'src2/'). Paths are relative to the indexed codebase root; leading '/', '..', '%' and double quotes are rejected.",
+                                    default: []
+                                },
+                                excludePaths: {
+                                    type: "array",
+                                    items: {
+                                        type: "string"
+                                    },
+                                    description: "Optional: drop results whose repo-relative path starts with one of these prefixes (e.g. ['test/', 'docs/']). Same prefix rules as includePaths. Applied in the vector database before ranking so excluded paths do not consume the result limit.",
+                                    default: []
                                 }
                             },
                             required: ["path", "query"]
